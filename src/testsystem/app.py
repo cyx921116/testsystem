@@ -7,12 +7,14 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from .auth import SESSION_COOKIE, AuthService, create_auth_router
 from .compiler import ScriptValidationError, SUPPORTED_PROTOCOLS, compile_script
+from .data_codec import DataCodecError, validate_codec_config
 from .database import DEFAULT_MES_CONFIG, DEFAULT_SETTINGS, Database
 from .executor import TestExecutor
 from .mes import MESUploadError, MESUploader, build_payload
@@ -23,6 +25,7 @@ from .utils import json_dumps, new_id, utc_now
 
 database = Database()
 executor = TestExecutor(database)
+auth_service = AuthService(database)
 
 
 @asynccontextmanager
@@ -36,9 +39,37 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Pilot 生产测试系统",
     description="SN 追溯、低代码测试编排、多协议通讯与 MES 报告上传",
-    version="1.0.0",
+    version="0.3.0",
     lifespan=lifespan,
 )
+app.include_router(create_auth_router(auth_service))
+
+
+def _operator_allowed(method: str, path: str) -> bool:
+    if path in {"/api/auth/me", "/api/auth/password"}:
+        return True
+    if method == "POST" and path in {"/api/test-runs", "/api/test-runs/scan"}:
+        return True
+    if method != "GET":
+        return False
+    return any(
+        path == root or path.startswith(f"{root}/")
+        for root in ("/api/dashboard", "/api/scripts", "/api/settings", "/api/test-runs", "/api/reports")
+    )
+
+
+@app.middleware("http")
+async def authenticate_request(request: Request, call_next: Any) -> Any:
+    path = request.url.path
+    if not (path == "/api" or path.startswith("/api/")) or path in {"/api/health", "/api/auth/login", "/api/auth/logout"}:
+        return await call_next(request)
+    user = auth_service.user_from_token(request.cookies.get(SESSION_COOKIE))
+    if user is None:
+        return JSONResponse(status_code=401, content={"detail": "登录已失效，请重新登录"})
+    request.state.user = user
+    if user["role"] != "admin" and not _operator_allowed(request.method, path):
+        return JSONResponse(status_code=403, content={"detail": "操作工仅可执行测试和查看测试结果"})
+    return await call_next(request)
 
 
 class ScriptPayload(BaseModel):
@@ -103,6 +134,7 @@ def _run(run_id: str) -> dict[str, Any]:
         raise HTTPException(404, "测试运行记录不存在")
     items = database.all("SELECT * FROM test_items WHERE run_id = ? ORDER BY sequence", (run_id,))
     report = database.one("SELECT id, report_no, mes_status FROM reports WHERE run_id = ?", (run_id,))
+    controls = database.all("SELECT * FROM control_events WHERE run_id = ? ORDER BY id", (run_id,))
     return {
         "id": row["id"],
         "sn": row["sn"],
@@ -122,6 +154,9 @@ def _run(run_id: str) -> dict[str, Any]:
         "items": [
             {
                 "item_id": item["item_id"],
+                "node_id": item["node_id"] or item["item_id"],
+                "path": item["path"] or item["item_id"],
+                "iteration": item["iteration"],
                 "name": item["item_name"],
                 "sequence": item["sequence"],
                 "status": item["status"],
@@ -135,6 +170,19 @@ def _run(run_id: str) -> dict[str, Any]:
                 "duration_ms": item["duration_ms"],
             }
             for item in items
+        ],
+        "controls": [
+            {
+                "node_id": control["node_id"],
+                "name": control["node_name"],
+                "type": control["node_type"],
+                "path": control["path"],
+                "status": control["status"],
+                "details": json.loads(control["details_json"]),
+                "started_at": control["started_at"],
+                "finished_at": control["finished_at"],
+            }
+            for control in controls
         ],
     }
 
@@ -278,6 +326,10 @@ def get_protocols() -> list[dict[str, Any]]:
 def save_protocol(name: str, payload: ConfigPayload) -> dict[str, Any]:
     if name not in SUPPORTED_PROTOCOLS:
         raise HTTPException(404, "通讯协议不存在")
+    try:
+        validate_codec_config(payload.config)
+    except DataCodecError as exc:
+        raise HTTPException(422, str(exc)) from exc
     database.execute(
         "INSERT INTO protocol_configs(name, config_json, updated_at) VALUES (?, ?, ?) "
         "ON CONFLICT(name) DO UPDATE SET config_json = excluded.config_json, updated_at = excluded.updated_at",
@@ -290,6 +342,10 @@ def save_protocol(name: str, payload: ConfigPayload) -> dict[str, Any]:
 def test_protocol(name: str, payload: ConfigPayload) -> dict[str, Any]:
     if name not in SUPPORTED_PROTOCOLS:
         raise HTTPException(404, "通讯协议不存在")
+    try:
+        validate_codec_config(payload.config)
+    except DataCodecError as exc:
+        raise HTTPException(422, str(exc)) from exc
     protocol = create_protocol(name, payload.config)
     try:
         return protocol.test_connection()
@@ -389,13 +445,11 @@ def scan_sn(payload: SNPayload) -> dict[str, Any]:
 
 
 @app.post("/api/test-runs", status_code=201)
-def start_test(payload: StartPayload) -> dict[str, Any]:
+def start_test(payload: StartPayload, request: Request) -> dict[str, Any]:
     sn = _validate_sn(payload.sn)
     script = _get_script(payload.script_id)
     station = str(database.setting("station_id", DEFAULT_SETTINGS["station_id"]))
-    operator = (payload.operator or database.setting("operator", "OP-001")).strip()
-    if not operator:
-        raise HTTPException(422, "操作员不能为空")
+    operator = request.state.user["username"]
     run_id = new_id("run")
     started_at = utc_now()
     definition = json.loads(script["definition_json"])
@@ -428,11 +482,13 @@ def start_test(payload: StartPayload) -> dict[str, Any]:
                     started_at,
                 ),
             )
-            for sequence, step in enumerate(definition["steps"]):
-                connection.execute(
-                    "INSERT INTO test_items(run_id, item_id, item_name, sequence, status) VALUES (?, ?, ?, ?, 'PENDING')",
-                    (run_id, step["id"], step["name"], sequence),
-                )
+            if definition.get("schema_version", 1) == 1:
+                for sequence, step in enumerate(definition["steps"]):
+                    connection.execute(
+                        "INSERT INTO test_items(run_id, item_id, node_id, path, item_name, sequence, status) "
+                        "VALUES (?, ?, ?, ?, ?, ?, 'PENDING')",
+                        (run_id, step["id"], step["id"], step["id"], step["name"], sequence),
+                    )
     except sqlite3.IntegrityError as exc:
         raise HTTPException(409, "SN 或工位状态冲突，请刷新后重试") from exc
     executor.submit(run_id)

@@ -145,6 +145,8 @@ def _validate_action(action: Any, path: str, errors: list[str]) -> None:
             expected = action.get("expected")
             if not isinstance(expected, list) or len(expected) != 2:
                 errors.append(f"{path}.expected 必须是 [下限, 上限]")
+            elif any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in expected):
+                errors.append(f"{path}.expected 上下限必须是十进制数值")
         if operator == "regex":
             try:
                 re.compile(str(action.get("expected", "")))
@@ -157,6 +159,11 @@ def _validate_action(action: Any, path: str, errors: list[str]) -> None:
 def compile_script(source: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(source, dict):
         raise ScriptValidationError(["脚本根节点必须是 JSON 对象"])
+    if source.get("schema_version") == 2:
+        from .control_compiler import compile_control_script
+
+        return compile_control_script(source)
+
     script = deepcopy(source)
     errors: list[str] = []
 

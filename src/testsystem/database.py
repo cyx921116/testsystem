@@ -43,6 +43,20 @@ CREATE TABLE IF NOT EXISTS settings (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS users (
+    username TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('admin', 'operator')),
+    password_salt TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    session_version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_users_role ON users(role, enabled);
+
 CREATE TABLE IF NOT EXISTS test_runs (
     id TEXT PRIMARY KEY,
     sn TEXT NOT NULL,
@@ -70,6 +84,9 @@ CREATE TABLE IF NOT EXISTS test_items (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id TEXT NOT NULL,
     item_id TEXT NOT NULL,
+    node_id TEXT,
+    path TEXT,
+    iteration INTEGER,
     item_name TEXT NOT NULL,
     sequence INTEGER NOT NULL,
     status TEXT NOT NULL DEFAULT 'PENDING' CHECK(status IN ('PENDING', 'RUNNING', 'PASS', 'FAIL')),
@@ -84,6 +101,23 @@ CREATE TABLE IF NOT EXISTS test_items (
     FOREIGN KEY(run_id) REFERENCES test_runs(id) ON DELETE CASCADE,
     UNIQUE(run_id, item_id)
 );
+
+CREATE TABLE IF NOT EXISTS control_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    node_name TEXT NOT NULL,
+    node_type TEXT NOT NULL,
+    path TEXT NOT NULL,
+    status TEXT NOT NULL,
+    details_json TEXT NOT NULL DEFAULT '{}',
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    FOREIGN KEY(run_id) REFERENCES test_runs(id) ON DELETE CASCADE,
+    UNIQUE(run_id, path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_control_events_run ON control_events(run_id, id);
 
 CREATE TABLE IF NOT EXISTS reports (
     id TEXT PRIMARY KEY,
@@ -175,12 +209,31 @@ class Database:
         with self.session() as connection:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript(SCHEMA)
+            item_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(test_items)").fetchall()
+            }
+            for name, definition in {"node_id": "TEXT", "path": "TEXT", "iteration": "INTEGER"}.items():
+                if name not in item_columns:
+                    connection.execute(f"ALTER TABLE test_items ADD COLUMN {name} {definition}")
+            connection.execute(
+                "UPDATE test_items SET node_id = COALESCE(node_id, item_id), path = COALESCE(path, item_id)"
+            )
             now = utc_now()
             for name, config in DEFAULT_PROTOCOL_CONFIGS.items():
                 connection.execute(
                     "INSERT OR IGNORE INTO protocol_configs(name, config_json, updated_at) VALUES (?, ?, ?)",
                     (name, json_dumps(config), now),
                 )
+                row = connection.execute("SELECT config_json FROM protocol_configs WHERE name = ?", (name,)).fetchone()
+                stored = json.loads(row["config_json"])
+                merged = {**config, **stored}
+                if "receive_format" not in stored and "response_format" in stored:
+                    merged["receive_format"] = stored["response_format"]
+                if merged != stored:
+                    connection.execute(
+                        "UPDATE protocol_configs SET config_json = ? WHERE name = ?",
+                        (json_dumps(merged), name),
+                    )
             for key, value in {**DEFAULT_SETTINGS, "mes": DEFAULT_MES_CONFIG}.items():
                 connection.execute(
                     "INSERT OR IGNORE INTO settings(key, value_json, updated_at) VALUES (?, ?, ?)",
@@ -192,6 +245,9 @@ class Database:
                     "INSERT INTO scripts(name, product_model, definition_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
                     (definition["name"], definition["product_model"], json_dumps(definition), now, now),
                 )
+        from .auth import AuthService
+
+        AuthService(self).initialize()
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -239,6 +295,11 @@ class Database:
                     "UPDATE test_items SET status = 'FAIL', message = ?, finished_at = ? "
                     "WHERE run_id = ? AND status IN ('PENDING', 'RUNNING')",
                     ("服务重启导致测试中断，可重新扫码测试", now, run["id"]),
+                )
+                connection.execute(
+                    "UPDATE control_events SET status = 'INTERRUPTED', finished_at = ? "
+                    "WHERE run_id = ? AND status = 'RUNNING'",
+                    (now, run["id"]),
                 )
                 connection.execute(
                     "UPDATE test_runs SET status = 'FAIL', error = ?, finished_at = ? WHERE id = ?",

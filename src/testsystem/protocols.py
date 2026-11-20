@@ -8,6 +8,7 @@ import threading
 import time
 from typing import Any
 
+from .data_codec import decode_payload, encode_payload
 from .protocol_definitions import PROTOCOL_DEFINITIONS
 
 
@@ -17,7 +18,8 @@ class ProtocolError(RuntimeError):
 
 def _as_int(value: Any) -> int:
     if isinstance(value, str):
-        return int(value.strip(), 0)
+        text = value.strip()
+        return int(text, 16) if text.lower().startswith("0x") else int(text, 10)
     return int(value)
 
 
@@ -51,13 +53,19 @@ class BaseProtocol:
     def close(self) -> None:
         self.connected = False
 
-    def send(self, data: Any, encoding: str = "text") -> None:
+    def encode_data(self, data: Any, encoding: str | None = None) -> bytes:
+        return encode_payload(data, self.config, encoding)
+
+    def decode_data(self, data: bytes, response_format: str | None = None) -> Any:
+        return decode_payload(data, self.config, response_format)
+
+    def send(self, data: Any, encoding: str | None = None) -> None:
         raise ProtocolError("当前协议不支持 send 动作")
 
     def receive(self, timeout_ms: int = 1000, size: int = 4096) -> Any:
         raise ProtocolError("当前协议不支持 receive 动作")
 
-    def request(self, data: Any, encoding: str = "text", timeout_ms: int = 1000) -> Any:
+    def request(self, data: Any, encoding: str | None = None, timeout_ms: int = 1000) -> Any:
         self.send(data, encoding)
         return self.receive(timeout_ms=timeout_ms)
 
@@ -77,7 +85,7 @@ class SimulatorProtocol(BaseProtocol):
     def set_context(self, context: dict[str, Any]) -> None:
         self.context = context
 
-    def request(self, data: Any, encoding: str = "text", timeout_ms: int = 1000) -> Any:
+    def request(self, data: Any, encoding: str | None = None, timeout_ms: int = 1000) -> Any:
         self.connect()
         time.sleep(max(0, int(self.config.get("latency_ms", 30))) / 1000)
         text = str(data).strip()
@@ -96,7 +104,7 @@ class SimulatorProtocol(BaseProtocol):
             return data
         return self.config.get("default_response", "OK")
 
-    def send(self, data: Any, encoding: str = "text") -> None:
+    def send(self, data: Any, encoding: str | None = None) -> None:
         self.connect()
 
     def receive(self, timeout_ms: int = 1000, size: int = 4096) -> Any:
@@ -128,15 +136,15 @@ class SerialProtocol(BaseProtocol):
         except Exception as exc:
             raise ProtocolError(f"串口连接失败：{exc}") from exc
 
-    def send(self, data: Any, encoding: str = "text") -> None:
+    def send(self, data: Any, encoding: str | None = None) -> None:
         self.connect()
-        self.client.write(_encode(data, encoding, self.config.get("encoding", "utf-8")))
+        self.client.write(self.encode_data(data, encoding))
         self.client.flush()
 
-    def receive(self, timeout_ms: int = 1000, size: int = 4096) -> str:
+    def receive(self, timeout_ms: int = 1000, size: int = 4096) -> Any:
         self.connect()
         self.client.timeout = timeout_ms / 1000
-        return _decode(self.client.read(size), self.config.get("encoding", "utf-8"))
+        return self.decode_data(self.client.read(size))
 
     def close(self) -> None:
         if self.connected:
@@ -162,11 +170,11 @@ class TcpProtocol(BaseProtocol):
         except OSError as exc:
             raise ProtocolError(f"TCP 连接失败：{exc}") from exc
 
-    def send(self, data: Any, encoding: str = "text") -> None:
+    def send(self, data: Any, encoding: str | None = None) -> None:
         self.connect()
-        self.client.sendall(_encode(data, encoding, self.config.get("encoding", "utf-8")))
+        self.client.sendall(self.encode_data(data, encoding))
 
-    def receive(self, timeout_ms: int = 1000, size: int = 4096) -> str:
+    def receive(self, timeout_ms: int = 1000, size: int = 4096) -> Any:
         self.connect()
         self.client.settimeout(timeout_ms / 1000)
         try:
@@ -175,7 +183,7 @@ class TcpProtocol(BaseProtocol):
             raise ProtocolError("TCP 接收超时") from exc
         if not data:
             raise ProtocolError("TCP 对端已关闭连接")
-        return _decode(data, self.config.get("encoding", "utf-8"))
+        return self.decode_data(data)
 
     def close(self) -> None:
         if self.connected:
@@ -206,17 +214,17 @@ class CanProtocol(BaseProtocol):
         except Exception as exc:
             raise ProtocolError(f"CAN 连接失败：{exc}") from exc
 
-    def send(self, data: Any, encoding: str = "hex") -> None:
+    def send(self, data: Any, encoding: str | None = None) -> None:
         self.connect()
         message = self.can.Message(
             arbitration_id=_as_int(self.config.get("arbitration_id", "0x701")),
             is_extended_id=bool(self.config.get("extended_id", False)),
             is_fd=bool(self.config.get("can_fd", False)),
-            data=_encode(data, encoding),
+            data=self.encode_data(data, encoding),
         )
         self.bus.send(message, timeout=float(self.config.get("timeout_ms", 1500)) / 1000)
 
-    def receive(self, timeout_ms: int = 1000, size: int = 4096) -> str:
+    def receive(self, timeout_ms: int = 1000, size: int = 4096) -> Any:
         self.connect()
         response_id = self.config.get("response_id")
         deadline = time.monotonic() + timeout_ms / 1000
@@ -229,7 +237,7 @@ class CanProtocol(BaseProtocol):
                 raise ProtocolError("CAN 接收超时")
             if response_id and message.arbitration_id != _as_int(response_id):
                 continue
-            return _decode(message.data, response_format=self.config.get("response_format", "hex"))
+            return self.decode_data(message.data)
 
     def close(self) -> None:
         if self.connected:
@@ -309,7 +317,7 @@ class BluetoothProtocol(BaseProtocol):
                 raise
             raise ProtocolError(f"BLE 通讯失败：{exc}") from exc
 
-    async def _request(self, data: Any, encoding: str, read: bool) -> Any:
+    async def _request(self, data: Any, encoding: str | None, read: bool) -> Any:
         try:
             from bleak import BleakClient
         except ImportError as exc:
@@ -320,21 +328,21 @@ class BluetoothProtocol(BaseProtocol):
                 raise ProtocolError("BLE 设备未连接")
             await client.write_gatt_char(
                 self.config["write_characteristic"],
-                _encode(data, encoding, self.config.get("encoding", "utf-8")),
+                self.encode_data(data, encoding),
                 response=bool(self.config.get("write_with_response", True)),
             )
             if read:
                 value = await client.read_gatt_char(self.config["read_characteristic"])
-                return _decode(value, self.config.get("encoding", "utf-8"))
+                return self.decode_data(value)
         return None
 
-    def request(self, data: Any, encoding: str = "text", timeout_ms: int = 1000) -> str:
+    def request(self, data: Any, encoding: str | None = None, timeout_ms: int = 1000) -> Any:
         return self._run(self._request(data, encoding, True))
 
-    def send(self, data: Any, encoding: str = "text") -> None:
+    def send(self, data: Any, encoding: str | None = None) -> None:
         self._run(self._request(data, encoding, False))
 
-    def receive(self, timeout_ms: int = 1000, size: int = 4096) -> str:
+    def receive(self, timeout_ms: int = 1000, size: int = 4096) -> Any:
         async def read() -> str:
             try:
                 from bleak import BleakClient
@@ -342,7 +350,7 @@ class BluetoothProtocol(BaseProtocol):
                 raise ProtocolError("缺少 bleak，请执行 uv sync --extra hardware") from exc
             async with BleakClient(self.config["address"], timeout=timeout_ms / 1000) as client:
                 value = await client.read_gatt_char(self.config["read_characteristic"])
-                return _decode(value, self.config.get("encoding", "utf-8"))
+                return self.decode_data(value)
 
         return self._run(read())
 
@@ -372,7 +380,7 @@ class MqttProtocol(BaseProtocol):
             raise ProtocolError("缺少 paho-mqtt，请执行 uv sync --extra hardware") from exc
         self.response_event = threading.Event()
         self.response_lock = threading.Lock()
-        self.last_response: str | None = None
+        self.last_response: bytes | None = None
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=self.config.get("client_id", ""))
         if self.config.get("username"):
             self.client.username_pw_set(self.config["username"], self.config.get("password", ""))
@@ -381,7 +389,7 @@ class MqttProtocol(BaseProtocol):
 
         def on_message(client: Any, userdata: Any, message: Any) -> None:
             with self.response_lock:
-                self.last_response = message.payload.decode("utf-8", errors="replace").strip()
+                self.last_response = bytes(message.payload)
             self.response_event.set()
 
         self.client.on_message = on_message
@@ -397,28 +405,29 @@ class MqttProtocol(BaseProtocol):
         except Exception as exc:
             raise ProtocolError(f"MQTT 连接失败：{exc}") from exc
 
-    def send(self, data: Any, encoding: str = "text") -> None:
+    def send(self, data: Any, encoding: str | None = None) -> None:
         self.connect()
-        payload = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False)
-        result = self.client.publish(self.config["request_topic"], payload, qos=int(self.config.get("qos", 1)))
+        result = self.client.publish(
+            self.config["request_topic"], self.encode_data(data, encoding), qos=int(self.config.get("qos", 1))
+        )
         result.wait_for_publish(timeout=float(self.config.get("timeout_ms", 3000)) / 1000)
 
-    def receive(self, timeout_ms: int = 1000, size: int = 4096) -> str:
+    def receive(self, timeout_ms: int = 1000, size: int = 4096) -> Any:
         self.connect()
         self.response_event.clear()
         if not self.response_event.wait(timeout_ms / 1000):
             raise ProtocolError("MQTT 响应超时")
         with self.response_lock:
-            return self.last_response or ""
+            return self.decode_data(self.last_response or b"")
 
-    def request(self, data: Any, encoding: str = "text", timeout_ms: int = 1000) -> str:
+    def request(self, data: Any, encoding: str | None = None, timeout_ms: int = 1000) -> Any:
         self.connect()
         self.response_event.clear()
         self.send(data, encoding)
         if not self.response_event.wait(timeout_ms / 1000):
             raise ProtocolError("MQTT 响应超时")
         with self.response_lock:
-            return self.last_response or ""
+            return self.decode_data(self.last_response or b"")
 
     def close(self) -> None:
         if self.connected:

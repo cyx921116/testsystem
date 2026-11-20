@@ -4,6 +4,9 @@ const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const clone = (value) => JSON.parse(JSON.stringify(value));
 const state = {
+  user: null,
+  users: [],
+  applicationMounted: false,
   scripts: [],
   selectedScriptId: null,
   draft: null,
@@ -17,6 +20,10 @@ const state = {
   mesConfig: {},
   settings: {},
   reports: [],
+  editorMode: "visual",
+  selectedStep: 0,
+  selectedAction: null,
+  drag: null,
 };
 
 const pageMeta = {
@@ -25,6 +32,7 @@ const pageMeta = {
   protocols: ["通讯配置", "管理串口、总线、网络与调试器连接"],
   mes: ["MES 集成", "配置报告报文、接口与工位上传策略"],
   reports: ["报告中心", "按 SN 追溯测试数据与 MES 上传状态"],
+  users: ["账号权限", "管理登录账号、角色和启用状态"],
 };
 
 const protocolSymbols = {
@@ -35,6 +43,11 @@ const protocolSymbols = {
 const actionLabels = {
   request: "发送并等待响应", send: "仅发送", receive: "等待接收", execute: "设备操作",
   set: "设置变量", assert: "结果断言", sleep: "延时等待",
+};
+
+const actionSymbols = {
+  request: "REQ", send: "TX", receive: "RX", execute: "EXE",
+  set: "SET", assert: "IF", sleep: "WAIT",
 };
 
 const operatorLabels = {
@@ -93,7 +106,10 @@ async function api(url, options = {}) {
       message = message.message || (Array.isArray(message) ? message.map((item) => item.msg).join("；") : JSON.stringify(message));
       if (payload?.detail?.errors) message += `：${payload.detail.errors.join("；")}`;
     }
-    throw new Error(message);
+    const error = new Error(message);
+    error.status = response.status;
+    if (response.status === 401 && !["/api/auth/login", "/api/auth/me"].includes(url)) showLogin();
+    throw error;
   }
   return payload;
 }
@@ -122,6 +138,7 @@ function parseSmartValue(value) {
 
 function navigate(page) {
   if (!pageMeta[page]) return;
+  if (state.user?.role !== "admin" && ["scripts", "protocols", "mes", "users"].includes(page)) page = "production";
   $$(".page").forEach((element) => element.classList.toggle("active", element.id === `page-${page}`));
   $$(".nav-item").forEach((element) => element.classList.toggle("active", element.dataset.page === page));
   $("#page-title").textContent = pageMeta[page][0];
@@ -132,6 +149,7 @@ function navigate(page) {
   if (page === "protocols") loadProtocols();
   if (page === "mes") loadMesSettings();
   if (page === "reports") loadReports();
+  if (page === "users") loadUsers();
 }
 
 async function loadDashboard() {
@@ -182,10 +200,29 @@ function renderTestItems(items) {
   }).join("") : '<tr><td colspan="6" class="empty-row">请选择测试流程</td></tr>';
 }
 
+function previewTestNodes(definition) {
+  const subflows = definition.subflows || {};
+  function collect(nodes, visited = new Set()) {
+    return (nodes || []).flatMap((node) => {
+      const type = node.type || "test";
+      if (type === "test") return [node];
+      if (type === "condition") return [...collect(node.then, visited), ...collect(node.else, visited)];
+      if (type === "parallel") return (node.branches || []).flatMap((branch) => collect(branch.steps, visited));
+      if (type === "loop") return collect(node.steps, visited);
+      if (type === "subflow" && subflows[node.subflow] && !visited.has(node.subflow)) {
+        const nextVisited = new Set(visited).add(node.subflow);
+        return collect(subflows[node.subflow].steps, nextVisited);
+      }
+      return [];
+    });
+  }
+  return collect(definition.steps);
+}
+
 function renderPreview() {
   const script = currentProductionScript();
   if (!script || state.run) return;
-  renderTestItems(script.definition.steps.map((step) => ({
+  renderTestItems(previewTestNodes(script.definition).map((step) => ({
     name: step.name, status: "PENDING", expected: step.actions.find((action) => action.type === "assert")?.expected,
   })));
   $("#unit-model").textContent = script.product_model;
@@ -335,8 +372,8 @@ async function resumeRun(runId) {
 
 function defaultAction(type = "request") {
   const defaults = {
-    request: { type, data: "AT+SELFTEST?", encoding: "text", save_as: "response" },
-    send: { type, data: "AT+START\r\n", encoding: "text" },
+    request: { type, data: "AT+SELFTEST?", save_as: "response" },
+    send: { type, data: "AT+START\r\n" },
     receive: { type, save_as: "response", timeout_ms: 1000, size: 4096 },
     execute: { type, operation: "read_holding_registers", params: { address: 0, count: 1 }, save_as: "result" },
     set: { type, variable: "expected_value", value: "PASS" },
@@ -365,8 +402,7 @@ function textActionField(si, ai, key, label, value, wide = false, type = "text")
 function renderAction(action, si, ai) {
   let fields = "";
   if (["request", "send"].includes(action.type)) {
-    fields += textActionField(si, ai, "data", "发送数据 / 支持 ${变量}", action.data, true);
-    fields += `<div class="action-field"><label>编码</label><select data-action-field data-s="${si}" data-a="${ai}" data-key="encoding">${optionTags({ text: "文本", hex: "HEX", json: "JSON" }, action.encoding || "text")}</select></div>`;
+    fields += textActionField(si, ai, "data", "十进制数据 / 文本指令 / 支持 ${变量}", action.data, true);
     if (action.type === "request") fields += textActionField(si, ai, "save_as", "响应保存为", action.save_as);
   } else if (action.type === "receive") {
     fields += textActionField(si, ai, "save_as", "响应保存为", action.save_as);
@@ -396,6 +432,149 @@ function renderAction(action, si, ai) {
   </div>`;
 }
 
+function setEditorMode(mode) {
+  state.editorMode = mode;
+  $$("[data-editor-mode]").forEach((button) => button.classList.toggle("active", button.dataset.editorMode === mode));
+  $("#react-flow-editor").hidden = mode !== "visual";
+  $("#steps-container").hidden = mode !== "list";
+  if (mode === "visual") window.PilotFlowEditor?.setDefinition(state.draft);
+}
+
+function actionSummary(action) {
+  if (["request", "send"].includes(action.type)) return action.save_as ? `${action.data} → ${action.save_as}` : action.data;
+  if (action.type === "receive") return `接收至 ${action.save_as} · ${action.timeout_ms} ms`;
+  if (action.type === "execute") return `${action.operation} ${JSON.stringify(action.params || {})}`;
+  if (action.type === "set") return `${action.variable} = ${displayValue(action.value)}`;
+  if (action.type === "assert") {
+    const expected = ["truthy", "exists"].includes(action.operator) ? "" : ` ${displayValue(action.expected)}`;
+    return `${displayValue(action.actual)} ${operatorLabels[action.operator] || action.operator}${expected}`;
+  }
+  if (action.type === "sleep") return `等待 ${action.duration_ms} ms`;
+  return action.type;
+}
+
+function selectFlowNode(stepIndex, actionIndex = null) {
+  state.selectedStep = stepIndex;
+  state.selectedAction = actionIndex;
+  renderVisualEditor();
+}
+
+function renderNodeInspector() {
+  const inspector = $("#node-inspector");
+  const step = state.draft?.steps?.[state.selectedStep];
+  if (!step) {
+    inspector.innerHTML = '<div class="inspector-empty"><strong>未选择节点</strong><p>从节点库拖入一个测试项，或点击画布中的节点编辑属性。</p></div>';
+    return;
+  }
+  const si = state.selectedStep;
+  const action = state.selectedAction === null ? null : step.actions[state.selectedAction];
+  if (action) {
+    inspector.innerHTML = `<div class="inspector-header"><span class="eyebrow">ACTION ${state.selectedAction + 1}</span><h3>${escapeHtml(actionLabels[action.type])}</h3><p>${escapeHtml(step.name)}</p></div><div class="inspector-action">${renderAction(action, si, state.selectedAction)}</div><p class="inspector-tip">动作在测试项内按顺序执行。可拖到其他动作前后或其他测试项中。</p>`;
+    return;
+  }
+  inspector.innerHTML = `<div class="inspector-header"><span class="eyebrow">STEP ${si + 1}</span><h3>测试项属性</h3><p>${escapeHtml(step.id)}</p></div>
+    <div class="inspector-fields">
+      <div class="field"><label>步骤 ID</label><input data-step-field="id" data-s="${si}" value="${escapeHtml(step.id)}"></div>
+      <div class="field"><label>测试项名称</label><input data-step-field="name" data-s="${si}" value="${escapeHtml(step.name)}"></div>
+      <div class="field"><label>通讯协议</label><select data-step-field="protocol" data-s="${si}">${optionTags(protocolSymbols, step.protocol)}</select></div>
+      <div class="field"><label>超时（毫秒）</label><input type="number" data-step-field="timeout_ms" data-s="${si}" value="${escapeHtml(step.timeout_ms)}"></div>
+      <div class="field"><label>失败后额外重试</label><input type="number" min="0" max="10" data-step-field="retries" data-s="${si}" value="${escapeHtml(step.retries)}"></div>
+      <div class="field"><label>失败策略</label><select data-step-field="on_fail" data-s="${si}">${optionTags({ stop: "停止后续", continue: "继续下一项" }, step.on_fail)}</select></div>
+    </div>
+    <div class="inspector-actions"><button class="btn btn-small btn-secondary" data-step-command="add-action" data-s="${si}">+ 添加断言</button><button class="btn btn-small btn-ghost danger-text" data-step-command="delete" data-s="${si}">删除测试项</button></div>
+    <p class="inspector-tip">拖动此节点标题可调整执行顺序。点击内部动作可编辑通讯数据和判定条件。</p>`;
+}
+
+function renderVisualEditor() {
+  if (!$("#visual-editor")) return;
+  const steps = state.draft?.steps || [];
+  if (!steps.length) {
+    state.selectedStep = -1;
+    state.selectedAction = null;
+  } else {
+    if (state.selectedStep < 0 || state.selectedStep >= steps.length) state.selectedStep = 0;
+    const actions = steps[state.selectedStep].actions || [];
+    if (state.selectedAction !== null && state.selectedAction >= actions.length) state.selectedAction = null;
+  }
+  $("#palette-actions").innerHTML = Object.entries(actionLabels).map(([type, label]) => `
+    <div class="palette-action" draggable="true" data-palette-action="${escapeHtml(type)}"><span class="palette-symbol">${escapeHtml(actionSymbols[type])}</span><strong>${escapeHtml(label)}</strong><small>${escapeHtml(type)}</small></div>`).join("");
+  $("#flow-steps").innerHTML = steps.map((step, si) => `
+    <div class="flow-step-wrap">
+      <article class="flow-node ${si === state.selectedStep ? "selected" : ""}" data-flow-step="${si}" data-drop-step="${si}">
+        <header class="flow-node-header" draggable="true" data-step-drag="${si}" title="拖动调整测试项顺序"><span class="drag-handle">⋮⋮</span><span class="flow-node-number">${si + 1}</span><div><strong class="flow-node-title">${escapeHtml(step.name)}</strong><small>${escapeHtml(step.id)}</small></div><span class="flow-protocol">${escapeHtml(step.protocol)}</span></header>
+        <div class="flow-node-meta"><span>超时 ${escapeHtml(step.timeout_ms)} ms</span><span>重试 ${escapeHtml(step.retries)}</span><span class="${step.on_fail === "stop" ? "fail-stop" : "fail-continue"}">FAIL ${step.on_fail === "stop" ? "停止后续" : "继续下一项"}</span></div>
+        <div class="flow-actions">${(step.actions || []).map((action, ai) => `
+          <button type="button" class="flow-action ${si === state.selectedStep && ai === state.selectedAction ? "selected" : ""}" draggable="true" data-action-node data-action-drag data-drop-action="${ai}" data-s="${si}" data-a="${ai}" title="拖动调整动作顺序，点击编辑"><span class="flow-action-type">${escapeHtml(actionSymbols[action.type] || action.type)}</span><span><strong>${ai + 1}. ${escapeHtml(actionLabels[action.type] || action.type)}</strong><small>${escapeHtml(actionSummary(action))}</small></span></button>`).join("")}</div>
+        <div class="flow-drop-hint">拖动作到这里</div>
+      </article>
+      <div class="flow-edge"><i></i><span>${si === steps.length - 1 ? "写入测试结果" : "PASS 下一项"}</span></div>
+    </div>`).join("");
+  renderNodeInspector();
+}
+
+function handleEditorInput(event) {
+  const stepInput = event.target.closest("[data-step-field]");
+  if (stepInput) {
+    const step = state.draft.steps[Number(stepInput.dataset.s)];
+    if (step) step[stepInput.dataset.stepField] = ["timeout_ms", "retries"].includes(stepInput.dataset.stepField) ? Number(stepInput.value) : stepInput.value;
+    return;
+  }
+  if (event.target.matches("[data-action-field]")) updateActionField(event.target);
+}
+
+function handleEditorChange(event) {
+  if (event.target.closest("[data-step-field]")) renderVisualEditor();
+  if (event.target.matches("[data-action-field]")) {
+    updateActionField(event.target);
+    if (event.target.dataset.key !== "operator") renderVisualEditor();
+  }
+  if (event.target.matches("[data-action-type]")) {
+    const si = Number(event.target.dataset.s);
+    const ai = Number(event.target.dataset.a);
+    state.draft.steps[si].actions[ai] = defaultAction(event.target.value);
+    state.selectedStep = si;
+    state.selectedAction = ai;
+    renderSteps();
+  }
+}
+
+function handleEditorCommand(event) {
+  const deleteButton = event.target.closest("[data-delete-action]");
+  if (deleteButton) {
+    const si = Number(deleteButton.dataset.s);
+    state.draft = FlowModel.removeAction(state.draft, si, Number(deleteButton.dataset.a));
+    state.selectedStep = si;
+    state.selectedAction = null;
+    renderSteps();
+    return;
+  }
+  const button = event.target.closest("[data-step-command]");
+  if (!button) return;
+  const index = Number(button.dataset.s);
+  const command = button.dataset.stepCommand;
+  if (command === "delete") {
+    state.draft = FlowModel.removeStep(state.draft, index);
+    state.selectedStep = Math.max(0, index - 1);
+    state.selectedAction = null;
+  }
+  if (command === "add-action") {
+    state.draft = FlowModel.insertAction(state.draft, index, defaultAction("assert"));
+    state.selectedStep = index;
+    state.selectedAction = state.draft.steps[index].actions.length - 1;
+  }
+  if (command === "up" && index > 0) {
+    state.draft = FlowModel.moveStep(state.draft, index, index - 1);
+    state.selectedStep = index - 1;
+    state.selectedAction = null;
+  }
+  if (command === "down" && index < state.draft.steps.length - 1) {
+    state.draft = FlowModel.moveStep(state.draft, index, index + 2);
+    state.selectedStep = index + 1;
+    state.selectedAction = null;
+  }
+  renderSteps();
+}
+
 function renderSteps() {
   const steps = state.draft?.steps || [];
   $("#steps-container").innerHTML = steps.length ? steps.map((step, si) => `
@@ -414,6 +593,9 @@ function renderSteps() {
       <div class="actions-label"><strong>逻辑动作（依次执行）</strong><button class="text-button" data-step-command="add-action" data-s="${si}">+ 添加动作</button></div>
       <div class="action-list">${(step.actions || []).map((action, ai) => renderAction(action, si, ai)).join("")}</div>
     </section>`).join("") : '<div class="validation error">尚无测试项，请点击“添加测试项”。</div>';
+  $("#script-json").value = JSON.stringify(state.draft, null, 2);
+  renderVisualEditor();
+  window.PilotFlowEditor?.setDefinition(state.draft);
 }
 
 function openScript(scriptId) {
@@ -422,6 +604,8 @@ function openScript(scriptId) {
   state.draftId = script.id;
   state.draftVersion = script.version;
   state.draft = clone(script.definition);
+  state.selectedStep = 0;
+  state.selectedAction = null;
   renderScriptLibrary();
 }
 
@@ -450,6 +634,8 @@ function createNewScript() {
   state.draftId = null;
   state.draftVersion = null;
   state.draft = { schema_version: 1, name: "新产品测试流程", product_model: "NEW-MODEL", variables: {}, steps: [newStep()] };
+  state.selectedStep = 0;
+  state.selectedAction = null;
   renderScriptLibrary();
   $("#draft-name").focus();
 }
@@ -510,15 +696,141 @@ function updateActionField(element) {
   }
 }
 
+function clearDragStyles() {
+  $$(".drag-over", $("#visual-editor")).forEach((element) => element.classList.remove("drag-over"));
+}
+
+function bindVisualEditor() {
+  const visual = $("#visual-editor");
+  if (!visual) return;
+  visual.addEventListener("dragstart", (event) => {
+    const paletteStep = event.target.closest("[data-palette-step]");
+    const paletteAction = event.target.closest("[data-palette-action]");
+    const action = event.target.closest("[data-action-drag]");
+    const step = event.target.closest("[data-step-drag]");
+    if (paletteStep) state.drag = { kind: "palette-step" };
+    else if (paletteAction) state.drag = { kind: "palette-action", actionType: paletteAction.dataset.paletteAction };
+    else if (action) state.drag = { kind: "action", fromStep: Number(action.dataset.s), fromAction: Number(action.dataset.a) };
+    else if (step) state.drag = { kind: "step", from: Number(step.dataset.stepDrag) };
+    else return;
+    if (event.dataTransfer) {
+      event.dataTransfer.effectAllowed = state.drag.kind.startsWith("palette") ? "copy" : "move";
+      event.dataTransfer.setData("text/plain", state.drag.kind);
+    }
+  });
+  visual.addEventListener("dragend", () => {
+    state.drag = null;
+    clearDragStyles();
+  });
+  visual.addEventListener("dragover", (event) => {
+    if (!state.drag) return;
+    const actionTarget = event.target.closest("[data-drop-action]");
+    const stepTarget = event.target.closest("[data-drop-step]");
+    const endTarget = event.target.closest("[data-drop-end]");
+    const actionDrag = ["palette-action", "action"].includes(state.drag.kind);
+    if ((!actionTarget && !stepTarget && !endTarget) || (endTarget && actionDrag)) return;
+    event.preventDefault();
+    clearDragStyles();
+    (actionTarget || stepTarget || endTarget).classList.add("drag-over");
+    if (event.dataTransfer) event.dataTransfer.dropEffect = state.drag.kind.startsWith("palette") ? "copy" : "move";
+  });
+  visual.addEventListener("drop", (event) => {
+    if (!state.drag) return;
+    const drag = state.drag;
+    const actionTarget = event.target.closest("[data-drop-action]");
+    const stepTarget = event.target.closest("[data-drop-step]");
+    const endTarget = event.target.closest("[data-drop-end]");
+    if (!actionTarget && !stepTarget && !endTarget) return;
+    event.preventDefault();
+    event.stopPropagation();
+    state.drag = null;
+    clearDragStyles();
+    try {
+      if (actionTarget && ["palette-action", "action"].includes(drag.kind)) {
+        event.stopPropagation();
+        const si = Number(actionTarget.dataset.s);
+        const rect = actionTarget.getBoundingClientRect();
+        const offset = event.clientY > rect.top + rect.height / 2 ? 1 : 0;
+        const ai = Number(actionTarget.dataset.dropAction) + offset;
+        state.draft = drag.kind === "palette-action"
+          ? FlowModel.insertAction(state.draft, si, defaultAction(drag.actionType), ai)
+          : FlowModel.moveAction(state.draft, drag.fromStep, drag.fromAction, si, ai);
+        state.selectedStep = si;
+        state.selectedAction = null;
+      } else if (stepTarget) {
+        const si = Number(stepTarget.dataset.dropStep);
+        if (["palette-action", "action"].includes(drag.kind)) {
+          const ai = state.draft.steps[si].actions.length;
+          state.draft = drag.kind === "palette-action"
+            ? FlowModel.insertAction(state.draft, si, defaultAction(drag.actionType), ai)
+            : FlowModel.moveAction(state.draft, drag.fromStep, drag.fromAction, si, ai);
+        } else {
+          const rect = stepTarget.getBoundingClientRect();
+          const offset = event.clientY > rect.top + rect.height / 2 ? 1 : 0;
+          const target = si + offset;
+          state.draft = drag.kind === "palette-step"
+            ? FlowModel.insertStep(state.draft, newStep(target), target)
+            : FlowModel.moveStep(state.draft, drag.from, target);
+          state.selectedStep = drag.kind === "step" && drag.from < target ? target - 1 : target;
+        }
+        state.selectedAction = null;
+      } else if (endTarget && ["palette-step", "step"].includes(drag.kind)) {
+        const target = state.draft.steps.length;
+        state.draft = drag.kind === "palette-step"
+          ? FlowModel.insertStep(state.draft, newStep(target), target)
+          : FlowModel.moveStep(state.draft, drag.from, target);
+        state.selectedStep = state.draft.steps.length - 1;
+        state.selectedAction = null;
+      }
+      renderSteps();
+    } catch (error) {
+      toast(`无法放置节点：${error.message}`, "error");
+    }
+  });
+  visual.addEventListener("click", (event) => {
+    const paletteStep = event.target.closest("[data-palette-step]");
+    const paletteAction = event.target.closest("[data-palette-action]");
+    if (paletteStep) {
+      const index = state.draft.steps.length;
+      state.draft = FlowModel.insertStep(state.draft, newStep(index), index);
+      state.selectedStep = index;
+      state.selectedAction = null;
+      renderSteps();
+      return;
+    }
+    if (paletteAction) {
+      if (state.selectedStep < 0 || !state.draft.steps.length) {
+        toast("请先添加一个测试项", "error");
+        return;
+      }
+      const si = state.selectedStep;
+      state.draft = FlowModel.insertAction(state.draft, si, defaultAction(paletteAction.dataset.paletteAction));
+      state.selectedAction = state.draft.steps[si].actions.length - 1;
+      renderSteps();
+      return;
+    }
+    const action = event.target.closest("[data-action-node]");
+    if (action) {
+      selectFlowNode(Number(action.dataset.s), Number(action.dataset.a));
+      return;
+    }
+    const step = event.target.closest("[data-flow-step]");
+    if (step) selectFlowNode(Number(step.dataset.flowStep));
+  });
+}
+
 function bindScriptEditor() {
   $("#new-script").addEventListener("click", createNewScript);
   $("#validate-script").addEventListener("click", () => validateScript());
   $("#save-script").addEventListener("click", saveScript);
   $("#add-step").addEventListener("click", () => {
-    state.draft.steps ||= [];
-    state.draft.steps.push(newStep(state.draft.steps.length));
+    const index = state.draft.steps.length;
+    state.draft = FlowModel.insertStep(state.draft, newStep(index), index);
+    state.selectedStep = index;
+    state.selectedAction = null;
     renderSteps();
   });
+  $$("[data-editor-mode]").forEach((button) => button.addEventListener("click", () => setEditorMode(button.dataset.editorMode)));
   $("#script-list").addEventListener("click", (event) => {
     const button = event.target.closest("[data-script-select]");
     if (button) openScript(button.dataset.scriptSelect);
@@ -526,41 +838,14 @@ function bindScriptEditor() {
   [$("#draft-name"), $("#draft-model")].forEach((input) => input.addEventListener("input", () => {
     state.draft[input.dataset.draftField] = input.value;
   }));
-  $("#steps-container").addEventListener("input", (event) => {
-    const stepInput = event.target.closest("[data-step-field]");
-    if (stepInput) {
-      const step = state.draft.steps[Number(stepInput.dataset.s)];
-      if (step) step[stepInput.dataset.stepField] = ["timeout_ms", "retries"].includes(stepInput.dataset.stepField) ? Number(stepInput.value) : stepInput.value;
-      return;
-    }
-    if (event.target.matches("[data-action-field]")) updateActionField(event.target);
+  [$("#steps-container"), $("#node-inspector")].filter(Boolean).forEach((container) => {
+    container.addEventListener("input", handleEditorInput);
+    container.addEventListener("change", handleEditorChange);
+    container.addEventListener("click", handleEditorCommand);
   });
-  $("#steps-container").addEventListener("change", (event) => {
-    if (event.target.matches("[data-action-field]")) updateActionField(event.target);
-    if (event.target.matches("[data-action-type]")) {
-      const si = Number(event.target.dataset.s);
-      const ai = Number(event.target.dataset.a);
-      state.draft.steps[si].actions[ai] = defaultAction(event.target.value);
-      renderSteps();
-    }
-  });
-  $("#steps-container").addEventListener("click", (event) => {
-    const deleteButton = event.target.closest("[data-delete-action]");
-    if (deleteButton) {
-      const step = state.draft.steps[Number(deleteButton.dataset.s)];
-      step.actions.splice(Number(deleteButton.dataset.a), 1);
-      renderSteps();
-      return;
-    }
-    const button = event.target.closest("[data-step-command]");
-    if (!button) return;
-    const index = Number(button.dataset.s);
-    const command = button.dataset.stepCommand;
-    if (command === "delete") state.draft.steps.splice(index, 1);
-    if (command === "add-action") state.draft.steps[index].actions.push(defaultAction("assert"));
-    if (command === "up" && index > 0) [state.draft.steps[index - 1], state.draft.steps[index]] = [state.draft.steps[index], state.draft.steps[index - 1]];
-    if (command === "down" && index < state.draft.steps.length - 1) [state.draft.steps[index + 1], state.draft.steps[index]] = [state.draft.steps[index], state.draft.steps[index + 1]];
-    renderSteps();
+  bindVisualEditor();
+  $("#script-json").closest("details").addEventListener("toggle", (event) => {
+    if (event.target.open) $("#script-json").value = JSON.stringify(state.draft, null, 2);
   });
   $("#apply-script-json").addEventListener("click", () => {
     try {
@@ -568,6 +853,8 @@ function bindScriptEditor() {
       if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") throw new Error("流程根节点必须是 JSON 对象");
       state.draft = parsed;
       state.draft.steps ||= [];
+      state.selectedStep = state.draft.steps.length ? 0 : -1;
+      state.selectedAction = null;
       $("#draft-name").value = state.draft.name || "";
       $("#draft-model").value = state.draft.product_model || "";
       renderSteps();
@@ -588,6 +875,13 @@ function selectedProtocol() {
   return state.protocols.find((item) => item.name === state.selectedProtocol);
 }
 
+function updateProtocolDependencies() {
+  $$('[data-config-depends-key]', $("#protocol-form")).forEach((element) => {
+    const controller = $(`[data-config-key="${element.dataset.configDependsKey}"]`, $("#protocol-form"));
+    element.hidden = controller?.value !== element.dataset.configDependsValue;
+  });
+}
+
 function renderProtocols() {
   $("#protocol-tabs").innerHTML = state.protocols.map((protocol) => `
     <button class="protocol-tab ${protocol.name === state.selectedProtocol ? "active" : ""}" data-protocol="${escapeHtml(protocol.name)}">
@@ -599,20 +893,33 @@ function renderProtocols() {
   $("#protocol-description").textContent = protocol.description;
   $("#driver-badge").className = `badge ${protocol.driver_available ? "badge-pass" : "badge-pending"}`;
   $("#driver-badge").textContent = protocol.driver_available ? "DRIVER READY" : "DRIVER MISSING";
-  $("#protocol-form").innerHTML = protocol.fields.map((field) => {
-    const value = protocol.config[field.key] ?? field.default;
-    if (field.type === "checkbox") {
-      return `<div class="checkbox-field"><input type="checkbox" id="config-${escapeHtml(field.key)}" data-config-key="${escapeHtml(field.key)}" data-kind="checkbox" ${value ? "checked" : ""}><label for="config-${escapeHtml(field.key)}">${escapeHtml(field.label)}</label></div>`;
-    }
-    if (field.type === "select") {
-      return `<div class="field"><label>${escapeHtml(field.label)}</label><select data-config-key="${escapeHtml(field.key)}" data-kind="select">${field.options.map((option) => `<option value="${escapeHtml(option.value)}" ${option.value === value ? "selected" : ""}>${escapeHtml(option.label)}</option>`).join("")}</select></div>`;
-    }
-    if (field.type === "json") {
-      return `<div class="field span-2"><label>${escapeHtml(field.label)}</label><textarea class="code-input" rows="5" data-config-key="${escapeHtml(field.key)}" data-kind="json">${escapeHtml(JSON.stringify(value || {}, null, 2))}</textarea></div>`;
-    }
-    const type = ["number", "password"].includes(field.type) ? field.type : "text";
-    return `<div class="field"><label>${escapeHtml(field.label)}${field.required ? " *" : ""}</label><input type="${type}" data-config-key="${escapeHtml(field.key)}" data-kind="${type}" value="${escapeHtml(value ?? "")}" placeholder="${escapeHtml(field.placeholder || "")}"></div>`;
-  }).join("");
+  const groups = { connection: [], downlink: [], uplink: [] };
+  protocol.fields.forEach((field) => (groups[field.group || "connection"] ||= []).push(field));
+  const groupMeta = {
+    connection: ["连接参数", "硬件地址、通讯速率与驱动参数"],
+    downlink: ["下发编码", "低代码页面输入十进制数值，这里决定实际写入设备的字节"],
+    uplink: ["响应解析", "把设备返回的字节转换为断言可直接使用的数值或文本"],
+  };
+  $("#protocol-form").innerHTML = Object.entries(groups).filter(([, fields]) => fields.length).map(([group, fields]) => `
+    <section class="config-section"><div class="config-section-title"><h3>${groupMeta[group][0]}</h3><p>${groupMeta[group][1]}</p></div><div class="config-section-fields">${fields.map((field) => {
+      let value = protocol.config[field.key] ?? (field.key === "receive_format" ? protocol.config.response_format : undefined) ?? field.default;
+      if (field.type === "number" && typeof value === "string" && /^0x[0-9a-f]+$/i.test(value)) value = Number.parseInt(value, 16);
+      const dependency = field.depends_on?.key ? `data-config-depends-key="${escapeHtml(field.depends_on.key)}" data-config-depends-value="${escapeHtml(field.depends_on.value)}"` : "";
+      const help = field.help ? `<small>${escapeHtml(field.help)}</small>` : "";
+      if (field.type === "checkbox") {
+        return `<div class="checkbox-field"><input type="checkbox" id="config-${escapeHtml(field.key)}" data-config-key="${escapeHtml(field.key)}" data-kind="checkbox" ${value ? "checked" : ""}><label for="config-${escapeHtml(field.key)}">${escapeHtml(field.label)}</label></div>`;
+      }
+      if (field.type === "select") {
+        return `<div class="field" ${dependency}><label>${escapeHtml(field.label)}</label><select data-config-key="${escapeHtml(field.key)}" data-kind="select">${field.options.map((option) => `<option value="${escapeHtml(option.value)}" ${String(option.value) === String(value) ? "selected" : ""}>${escapeHtml(option.label)}</option>`).join("")}</select>${help}</div>`;
+      }
+      if (field.type === "json") {
+        return `<div class="field span-2" ${dependency}><label>${escapeHtml(field.label)}</label><textarea class="code-input" rows="5" data-config-key="${escapeHtml(field.key)}" data-kind="json">${escapeHtml(JSON.stringify(value || {}, null, 2))}</textarea>${help}</div>`;
+      }
+      const type = ["number", "password"].includes(field.type) ? field.type : "text";
+      const numberOptions = type === "number" ? 'step="any" inputmode="decimal"' : "";
+      return `<div class="field" ${dependency}><label>${escapeHtml(field.label)}${field.required ? " *" : ""}</label><input type="${type}" ${numberOptions} data-config-key="${escapeHtml(field.key)}" data-kind="${type}" value="${escapeHtml(value ?? "")}" placeholder="${escapeHtml(field.placeholder || "")}">${help}</div>`;
+    }).join("")}</div></section>`).join("");
+  updateProtocolDependencies();
   $("#protocol-json").value = JSON.stringify(protocol.config, null, 2);
   $("#protocol-test-result").textContent = "";
   $("#protocol-test-result").className = "";
@@ -659,11 +966,27 @@ async function testProtocol() {
   }
 }
 
+function applyStationSettings(settings) {
+  state.settings = settings;
+  $("#setting-station").value = settings.station_id;
+  $("#setting-operator").value = settings.operator;
+  $("#setting-sn-pattern").value = settings.sn_pattern;
+  $("#setting-auto-upload").checked = Boolean(settings.auto_upload);
+  $("#sidebar-station").textContent = settings.station_id;
+  if (!state.run) $("#operator-input").value = state.user?.username || settings.operator;
+  renderPreview();
+}
+
+async function loadStationSettings() {
+  const settings = await api("/api/settings");
+  applyStationSettings(settings);
+  return settings;
+}
+
 async function loadMesSettings() {
   try {
-    const [config, settings] = await Promise.all([api("/api/mes/config"), api("/api/settings")]);
+    const [config] = await Promise.all([api("/api/mes/config"), loadStationSettings()]);
     state.mesConfig = config;
-    state.settings = settings;
     $("#mes-endpoint").value = config.endpoint || "";
     $("#mes-method").value = config.method || "POST";
     $("#mes-timeout").value = config.timeout_seconds || 10;
@@ -671,13 +994,6 @@ async function loadMesSettings() {
     $("#mes-idempotency").value = config.idempotency_header || "Idempotency-Key";
     $("#mes-payload-mode").value = config.payload_mode || "mapped";
     $("#mes-mapping").value = JSON.stringify(config.payload_mapping || {}, null, 2);
-    $("#setting-station").value = settings.station_id;
-    $("#setting-operator").value = settings.operator;
-    $("#setting-sn-pattern").value = settings.sn_pattern;
-    $("#setting-auto-upload").checked = Boolean(settings.auto_upload);
-    $("#sidebar-station").textContent = settings.station_id;
-    if (!state.run) $("#operator-input").value = settings.operator;
-    renderPreview();
   } catch (error) { toast(error.message, "error"); }
 }
 
@@ -740,7 +1056,7 @@ async function loadReports() {
         <td>${escapeHtml(formatTime(report.finished_at))}<span class="sn-secondary">${formatDuration(report.duration_ms)}</span></td>
         <td>${statusBadge(report.status)}<span class="sn-secondary">${report.summary.passed}/${report.summary.total} 项通过</span></td>
         <td>${statusBadge(report.mes_status)}<span class="sn-secondary">${mesStatusText(report.mes_status)} · ${report.mes_attempts} 次</span></td>
-        <td><div class="table-actions"><button class="btn btn-secondary" data-report-id="${escapeHtml(report.id)}">详情</button>${report.mes_status !== "SUCCESS" ? `<button class="btn btn-ghost" data-upload-report="${escapeHtml(report.id)}">上传</button>` : ""}<button class="text-button" data-download-report="${escapeHtml(report.id)}">下载</button></div></td>
+        <td><div class="table-actions"><button class="btn btn-secondary" data-report-id="${escapeHtml(report.id)}">详情</button>${state.user?.role === "admin" && report.mes_status !== "SUCCESS" ? `<button class="btn btn-ghost" data-upload-report="${escapeHtml(report.id)}">上传</button>` : ""}<button class="text-button" data-download-report="${escapeHtml(report.id)}">下载</button></div></td>
       </tr>`).join("") : '<tr><td colspan="7" class="empty-row">未找到符合条件的报告</td></tr>';
   } catch (error) { toast(error.message, "error"); }
 }
@@ -767,10 +1083,11 @@ async function viewReport(reportId) {
         <div class="table-wrap"><table class="data-table"><thead><tr><th>#</th><th>测试项</th><th>实测 / 期望</th><th>重试</th><th>耗时</th><th>结果</th></tr></thead><tbody>
           ${report.items.map((item, index) => `<tr><td>${index + 1}</td><td><span class="sn-primary">${escapeHtml(item.name)}</span><span class="sn-secondary">${escapeHtml(item.message || "")}</span>${item.assertions?.length ? `<details><summary class="text-button">断言明细</summary><pre class="assertion-detail">${escapeHtml(JSON.stringify(item.assertions, null, 2))}</pre></details>` : ""}</td><td><span class="sn-primary">${escapeHtml(displayValue(item.actual))}</span><span class="sn-secondary">期望 ${escapeHtml(displayValue(item.expected))}</span></td><td>${item.attempts || 0}</td><td>${formatDuration(item.duration_ms)}</td><td>${statusBadge(item.status)}</td></tr>`).join("")}
         </tbody></table></div>
+        ${report.controls?.length ? `<h3 class="report-section-title">控制流执行记录</h3><div class="table-wrap"><table class="data-table"><thead><tr><th>节点</th><th>类型</th><th>路径</th><th>结果</th><th>明细</th></tr></thead><tbody>${report.controls.map((control) => `<tr><td>${escapeHtml(control.name)}</td><td>${escapeHtml(control.type)}</td><td><span class="sn-secondary">${escapeHtml(control.path)}</span></td><td>${statusBadge(control.status)}</td><td><details><summary class="text-button">查看</summary><pre class="assertion-detail">${escapeHtml(JSON.stringify(control.details, null, 2))}</pre></details></td></tr>`).join("")}</tbody></table></div>` : ""}
         <div class="report-mes-info"><strong>MES：${escapeHtml(mesStatusText(report.mes_status))}</strong> · 已尝试 ${report.mes_attempts} 次${report.uploaded_at ? ` · ${escapeHtml(formatTime(report.uploaded_at))}` : ""}${report.mes_response ? `<br>响应：${escapeHtml(report.mes_response)}` : ""}</div>
         ${logs.length ? `<details class="advanced-editor"><summary>MES 上传日志 <span>${logs.length} 条</span></summary><pre class="json-preview">${escapeHtml(JSON.stringify(logs, null, 2))}</pre></details>` : ""}
       </div>
-      <div class="report-footer"><button class="btn btn-ghost" data-print-report>打印报告</button><button class="btn btn-secondary" data-download-report="${escapeHtml(report.id)}">下载 JSON</button>${report.mes_status !== "SUCCESS" ? `<button class="btn btn-primary" data-upload-report="${escapeHtml(report.id)}">${report.mes_status === "FAILED" ? "重试上传" : "上传 MES"}</button>` : ""}<button class="btn btn-ghost" data-close-modal>关闭</button></div>`;
+      <div class="report-footer"><button class="btn btn-ghost" data-print-report>打印报告</button><button class="btn btn-secondary" data-download-report="${escapeHtml(report.id)}">下载 JSON</button>${state.user?.role === "admin" && report.mes_status !== "SUCCESS" ? `<button class="btn btn-primary" data-upload-report="${escapeHtml(report.id)}">${report.mes_status === "FAILED" ? "重试上传" : "上传 MES"}</button>` : ""}<button class="btn btn-ghost" data-close-modal>关闭</button></div>`;
   } catch (error) {
     $("#report-modal-content").innerHTML = `<div class="report-body"><p>${escapeHtml(error.message)}</p><button class="btn btn-secondary" data-close-modal>关闭</button></div>`;
   }
@@ -794,12 +1111,152 @@ async function uploadReport(reportId, button) {
   }
 }
 
+function roleText(role) {
+  return role === "admin" ? "管理员" : "操作工";
+}
+
+function applyRole() {
+  const user = state.user;
+  const isAdmin = user?.role === "admin";
+  $$("[data-admin-only]").forEach((element) => { element.hidden = !isAdmin; });
+  $("#current-user").textContent = user?.display_name || "未登录";
+  $("#current-role").textContent = user ? `${roleText(user.role)} · ${user.username}` : "—";
+  $("#user-avatar").textContent = user?.display_name?.slice(0, 1).toUpperCase() || "—";
+  $("#topbar-role").textContent = user ? roleText(user.role) : "—";
+  $("#operator-input").value = user?.username || "";
+  if (!isAdmin) $("#report-mes").value = "";
+}
+
+function showLogin(message = "") {
+  clearTimeout(state.pollTimer);
+  state.user = null;
+  state.run = null;
+  state.scan = null;
+  $("#app-shell").hidden = true;
+  $("#auth-screen").hidden = false;
+  $("#login-password").value = "";
+  $("#login-error").textContent = message;
+  document.body.classList.add("authenticating");
+}
+
+function showApplication(user) {
+  state.user = user;
+  document.body.classList.remove("authenticating");
+  $("#auth-screen").hidden = true;
+  $("#app-shell").hidden = false;
+  applyRole();
+}
+
+async function login(event) {
+  event.preventDefault();
+  const button = $("#login-submit");
+  button.disabled = true;
+  $("#login-error").textContent = "";
+  try {
+    const result = await api("/api/auth/login", {
+      method: "POST",
+      body: { username: $("#login-username").value.trim(), password: $("#login-password").value },
+    });
+    showApplication(result.user);
+    await startApplication();
+  } catch (error) {
+    if (!state.user) $("#login-error").textContent = error.message;
+    else toast(error.message, "error");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function logout() {
+  try { await api("/api/auth/logout", { method: "POST" }); } catch {}
+  showLogin("已安全退出，请重新登录");
+}
+
+async function loadUsers() {
+  if (state.user?.role !== "admin") return;
+  try {
+    state.users = await api("/api/auth/users");
+    $("#user-count").textContent = state.users.length;
+    $("#users-table").innerHTML = state.users.map((user) => `<tr>
+      <td><span class="sn-primary">${escapeHtml(user.display_name)}</span><span class="sn-secondary">${escapeHtml(user.username)}</span></td>
+      <td><span class="badge ${user.role === "admin" ? "badge-running" : "badge-idle"}">${roleText(user.role)}</span></td>
+      <td>${user.enabled ? '<span class="badge badge-pass">启用</span>' : '<span class="badge badge-fail">停用</span>'}</td>
+      <td>${escapeHtml(formatTime(user.updated_at))}</td>
+      <td><div class="table-actions"><button class="btn btn-secondary" data-reset-user="${escapeHtml(user.username)}">重置密码</button><button class="btn btn-ghost" data-toggle-user="${escapeHtml(user.username)}" data-enabled="${user.enabled}" ${user.username === state.user.username ? "disabled" : ""}>${user.enabled ? "停用" : "启用"}</button></div></td>
+    </tr>`).join("") || '<tr><td colspan="5" class="empty-row">暂无用户</td></tr>';
+  } catch (error) { toast(error.message, "error"); }
+}
+
+async function createUser(event) {
+  event.preventDefault();
+  try {
+    await api("/api/auth/users", { method: "POST", body: {
+      username: $("#new-username").value.trim(),
+      display_name: $("#new-display-name").value.trim(),
+      role: $("#new-role").value,
+      password: $("#new-password").value,
+    } });
+    $("#user-form").reset();
+    toast("用户已创建", "success");
+    await loadUsers();
+  } catch (error) { toast(error.message, "error"); }
+}
+
+async function toggleUser(button) {
+  const username = button.dataset.toggleUser;
+  try {
+    await api(`/api/auth/users/${encodeURIComponent(username)}/enabled`, { method: "PUT", body: { enabled: button.dataset.enabled !== "true" } });
+    toast("账号状态已更新", "success");
+    await loadUsers();
+  } catch (error) { toast(error.message, "error"); }
+}
+
+async function resetUserPassword(button) {
+  const username = button.dataset.resetUser;
+  const password = window.prompt(`为用户 ${username} 设置新密码（至少 8 位）`);
+  if (password === null) return;
+  try {
+    await api(`/api/auth/users/${encodeURIComponent(username)}/password`, { method: "PUT", body: { password } });
+    if (username === state.user.username) showLogin("密码已重置，请使用新密码登录");
+    else toast("密码已重置，该用户需要重新登录", "success");
+  } catch (error) { toast(error.message, "error"); }
+}
+
+function closePasswordModal() {
+  $("#password-modal").hidden = true;
+  $("#password-form").reset();
+}
+
+async function changeOwnPassword(event) {
+  event.preventDefault();
+  const next = $("#new-own-password").value;
+  if (next !== $("#confirm-own-password").value) { toast("两次输入的新密码不一致", "error"); return; }
+  try {
+    await api("/api/auth/password", { method: "POST", body: { current_password: $("#current-password").value, new_password: next } });
+    closePasswordModal();
+    toast("密码已更新", "success");
+  } catch (error) { toast(error.message, "error"); }
+}
+
 function closeReport() {
   $("#report-modal").hidden = true;
   $("#report-modal-content").innerHTML = "";
 }
 
 function bindEvents() {
+  $("#login-form").addEventListener("submit", login);
+  $$("[data-fill-account]").forEach((button) => button.addEventListener("click", () => {
+    const username = button.dataset.fillAccount;
+    $("#login-username").value = username;
+    $("#login-password").value = username === "admin" ? "admin123" : "operator123";
+    $("#login-password").focus();
+  }));
+  $("#logout").addEventListener("click", logout);
+  $("#change-password").addEventListener("click", () => { $("#password-modal").hidden = false; $("#current-password").focus(); });
+  $("#password-form").addEventListener("submit", changeOwnPassword);
+  $$("[data-close-password]").forEach((button) => button.addEventListener("click", closePasswordModal));
+  $("#user-form").addEventListener("submit", createUser);
+  $("#protocol-form").addEventListener("change", updateProtocolDependencies);
   $$(".nav-item").forEach((button) => button.addEventListener("click", () => navigate(button.dataset.page)));
   $("#scan-form").addEventListener("submit", (event) => { event.preventDefault(); scanSn(); });
   $("#start-test").addEventListener("click", startTest);
@@ -831,12 +1288,17 @@ function bindEvents() {
     if (uploadButton) uploadReport(uploadButton.dataset.uploadReport, uploadButton);
     const downloadButton = event.target.closest("[data-download-report]");
     if (downloadButton) window.location.href = `/api/reports/${downloadButton.dataset.downloadReport}/download`;
+    const toggleUserButton = event.target.closest("[data-toggle-user]");
+    if (toggleUserButton) toggleUser(toggleUserButton);
+    const resetUserButton = event.target.closest("[data-reset-user]");
+    if (resetUserButton) resetUserPassword(resetUserButton);
     if (event.target.closest("[data-close-modal]")) closeReport();
     if (event.target.closest("[data-print-report]")) window.print();
   });
   $("#report-modal").addEventListener("click", (event) => { if (event.target === $("#report-modal")) closeReport(); });
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && !$("#report-modal").hidden) closeReport();
+    if (event.key === "Escape" && !$("#password-modal").hidden) closePasswordModal();
     if (event.key === "F2" && $("#page-production").classList.contains("active") && $("#report-modal").hidden) {
       event.preventDefault();
       startTest();
@@ -844,24 +1306,40 @@ function bindEvents() {
   });
 }
 
+async function startApplication() {
+  if (state.user?.role === "admin" && !state.applicationMounted) {
+    window.PilotFlowEditor?.mount($("#react-flow-editor"), {
+      initialDefinition: state.draft || { schema_version: 2, name: "新产品控制流程", product_model: "NEW-MODEL", variables: {}, steps: [], subflows: {} },
+      onChange: (definition) => {
+        state.draft = definition;
+        renderSteps();
+      },
+    });
+    state.applicationMounted = true;
+  }
+  const health = await api("/api/health");
+  $("#server-label").textContent = "后端服务已连接";
+  $("#server-dot").classList.remove("offline");
+  $("#sidebar-station").textContent = health.station;
+  await Promise.all([loadScripts(), loadStationSettings()]);
+  resetConsole();
+  const active = await api("/api/test-runs/active");
+  if (active) await resumeRun(active.id);
+  navigate(pageMeta[location.hash.slice(1)] ? location.hash.slice(1) : "production");
+}
+
 async function initialize() {
   bindEvents();
   setInterval(() => { $("#current-time").textContent = new Date().toLocaleString("zh-CN", { hour12: false }); }, 1000);
   $("#current-time").textContent = new Date().toLocaleString("zh-CN", { hour12: false });
   try {
-    const health = await api("/api/health");
-    $("#server-label").textContent = "后端服务已连接";
-    $("#server-dot").classList.remove("offline");
-    $("#sidebar-station").textContent = health.station;
-    await Promise.all([loadScripts(), loadMesSettings()]);
-    resetConsole();
-    const active = await api("/api/test-runs/active");
-    if (active) await resumeRun(active.id);
-    navigate(pageMeta[location.hash.slice(1)] ? location.hash.slice(1) : "production");
+    const result = await api("/api/auth/me");
+    showApplication(result.user);
+    await startApplication();
   } catch (error) {
     $("#server-label").textContent = "后端服务连接失败";
     $("#server-dot").classList.add("offline");
-    toast(error.message, "error");
+    showLogin(error.status === 401 ? "" : `连接失败：${error.message}`);
   }
 }
 

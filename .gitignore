@@ -3,6 +3,9 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .venv/
+node_modules/
+.edge-debug/
+.ui-debug-data/
 .idea/
 .vscode/
 data/

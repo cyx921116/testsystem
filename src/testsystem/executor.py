@@ -123,12 +123,12 @@ class TestExecutor:
             if action_type == "request":
                 data = render_template(action["data"], context)
                 remaining = max(1, int(step["timeout_ms"] - elapsed_ms))
-                last_value = protocol.request(data, action.get("encoding", "text"), remaining)
+                last_value = protocol.request(data, action.get("encoding"), remaining)
                 context["last_response"] = last_value
                 if action.get("save_as"):
                     context[action["save_as"]] = last_value
             elif action_type == "send":
-                protocol.send(render_template(action["data"], context), action.get("encoding", "text"))
+                protocol.send(render_template(action["data"], context), action.get("encoding"))
             elif action_type == "receive":
                 last_value = protocol.receive(int(action.get("timeout_ms", 1000)), int(action.get("size", 4096)))
                 context["last_response"] = last_value
@@ -206,6 +206,11 @@ class TestExecutor:
         if run is None or run["status"] != "RUNNING":
             return
         script = json.loads(run["script_snapshot_json"])
+        if script.get("schema_version") == 2:
+            from .control_flow import ControlFlowRunner
+
+            ControlFlowRunner(self, run, script, protocols).execute()
+            return
         context: dict[str, Any] = {
             **script.get("variables", {}),
             "sn": run["sn"],
@@ -292,6 +297,9 @@ class TestExecutor:
             for row in rows:
                 items.append({
                     "item_id": row["item_id"],
+                    "node_id": row["node_id"] or row["item_id"],
+                    "path": row["path"] or row["item_id"],
+                    "iteration": row["iteration"],
                     "name": row["item_name"],
                     "sequence": row["sequence"],
                     "status": "FAIL" if row["status"] in {"PENDING", "RUNNING"} else row["status"],
@@ -306,11 +314,16 @@ class TestExecutor:
                 })
             passed = sum(item["status"] == "PASS" for item in items)
             failed = len(items) - passed
-            status = "PASS" if failed == 0 and items else "FAIL"
+            status = "PASS" if failed == 0 and items and not run["error"] else "FAIL"
             duration_ms = _elapsed_ms(run["started_at"])
             report_id = new_id("report")
             report_no = f"RPT-{datetime.now(UTC):%Y%m%d}-{uuid.uuid4().hex[:8].upper()}"
             summary = {"total": len(items), "passed": passed, "failed": failed}
+            controls = connection.execute(
+                "SELECT * FROM control_events WHERE run_id = ? ORDER BY id", (run_id,)
+            ).fetchall()
+            if any(control["status"] in {"FAIL", "RUNNING", "INTERRUPTED"} for control in controls):
+                status = "FAIL"
             report = {
                 "schema_version": "1.0",
                 "id": report_id,
@@ -331,6 +344,19 @@ class TestExecutor:
                 "duration_ms": duration_ms,
                 "summary": summary,
                 "items": items,
+                "controls": [
+                    {
+                        "node_id": control["node_id"],
+                        "name": control["node_name"],
+                        "type": control["node_type"],
+                        "path": control["path"],
+                        "status": control["status"],
+                        "details": json.loads(control["details_json"]),
+                        "started_at": control["started_at"],
+                        "finished_at": control["finished_at"],
+                    }
+                    for control in controls
+                ],
             }
             connection.execute(
                 "UPDATE test_runs SET status = ?, current_item = NULL, finished_at = ? WHERE id = ?",

@@ -3,13 +3,35 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#102a2e">
+  <meta name="theme-color" content="#142b3a">
   <title>Pilot 生产测试系统</title>
   <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/flow-editor.css">
+  <script src="/static/flow-model.js" defer></script>
+  <script src="/static/flow-editor.js" defer></script>
   <script src="/static/app.js" defer></script>
 </head>
 <body>
-  <div class="app-shell">
+  <div class="auth-screen" id="auth-screen">
+    <section class="auth-card" aria-labelledby="login-title">
+      <div class="auth-brand"><div class="brand-mark"><span></span><span></span><span></span></div><div><strong>PILOT</strong><small>PRODUCTION TEST OS</small></div></div>
+      <div class="auth-heading"><span class="eyebrow">WORKSTATION ACCESS</span><h1 id="login-title">登录生产工作站</h1><p>身份将写入测试运行与报告，所有配置操作由后端按角色授权。</p></div>
+      <form id="login-form" class="login-form">
+        <div class="field"><label for="login-username">用户名</label><input id="login-username" autocomplete="username" placeholder="请输入用户名" required autofocus></div>
+        <div class="field"><label for="login-password">密码</label><input id="login-password" type="password" autocomplete="current-password" placeholder="请输入密码" required></div>
+        <p class="login-error" id="login-error" role="alert"></p>
+        <button class="btn btn-primary btn-large" id="login-submit" type="submit">登录工作站</button>
+      </form>
+      <div class="account-shortcuts">
+        <button type="button" data-fill-account="admin"><span>管理员</span><small>流程、协议、MES、账号与测试</small></button>
+        <button type="button" data-fill-account="operator"><span>操作工</span><small>扫码、测试与结果追溯</small></button>
+      </div>
+      <p class="auth-note">初始账号 admin / admin123，operator / operator123<br>首次登录后请通过“修改密码”更新凭据。</p>
+    </section>
+    <div class="auth-footnote">PILOT · 安全、清晰、可追溯的生产测试</div>
+  </div>
+
+  <div class="app-shell" id="app-shell" hidden>
     <aside class="sidebar">
       <div class="brand">
         <div class="brand-mark"><span></span><span></span><span></span></div>
@@ -25,15 +47,15 @@
           <svg viewBox="0 0 24 24"><path d="M4 5h16v11H4zM8 20h8M12 16v4M8 9h2m2 0h4M8 12h8"/></svg>
           <span>生产测试</span><small>01</small>
         </button>
-        <button class="nav-item" data-page="scripts">
+        <button class="nav-item" data-page="scripts" data-admin-only>
           <svg viewBox="0 0 24 24"><path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/></svg>
           <span>流程编排</span><small>02</small>
         </button>
-        <button class="nav-item" data-page="protocols">
+        <button class="nav-item" data-page="protocols" data-admin-only>
           <svg viewBox="0 0 24 24"><path d="M8 12h8M12 8v8M5 3H3v4m16-4h2v4M5 21H3v-4m16 4h2v-4M7 7h10v10H7z"/></svg>
           <span>通讯配置</span><small>03</small>
         </button>
-        <button class="nav-item" data-page="mes">
+        <button class="nav-item" data-page="mes" data-admin-only>
           <svg viewBox="0 0 24 24"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 15v5h14v-5"/></svg>
           <span>MES 集成</span><small>04</small>
         </button>
@@ -41,17 +63,27 @@
           <svg viewBox="0 0 24 24"><path d="M6 3h9l4 4v14H6zM15 3v5h4M9 12h6M9 16h6"/></svg>
           <span>报告中心</span><small>05</small>
         </button>
+        <button class="nav-item" data-page="users" data-admin-only>
+          <svg viewBox="0 0 24 24"><path d="M16 20v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 10a4 4 0 1 0 0-8 4 4 0 0 0 0 8M19 8v6M16 11h6"/></svg>
+          <span>账号权限</span><small>06</small>
+        </button>
       </nav>
+      <div class="user-session">
+        <span class="user-avatar" id="user-avatar">—</span>
+        <div><strong id="current-user">未登录</strong><small id="current-role">—</small></div>
+        <button id="change-password" title="修改密码">密码</button>
+        <button id="logout" title="退出登录">退出</button>
+      </div>
       <div class="sidebar-footer">
         <div class="server-state"><i id="server-dot"></i><span id="server-label">正在连接服务</span></div>
-        <span>Version 1.0.0</span>
+        <span>Version 0.3.0</span>
       </div>
     </aside>
 
     <main class="main-content">
       <header class="topbar">
         <div><h1 id="page-title">生产测试</h1><p id="page-subtitle">扫描产品 SN，执行测试并绑定唯一报告</p></div>
-        <div class="topbar-right"><span id="current-time"></span><span class="env-badge">PRODUCTION</span></div>
+        <div class="topbar-right"><span id="current-time"></span><span class="role-badge" id="topbar-role">—</span><span class="env-badge">PRODUCTION</span></div>
       </header>
 
       <div class="page-container">
@@ -103,7 +135,7 @@
                 <div><dt>脚本版本</dt><dd id="unit-script-version">—</dd></div>
                 <div><dt>开始时间</dt><dd id="unit-started">—</dd></div>
               </dl>
-              <div class="operator-field"><label for="operator-input">测试操作员</label><input id="operator-input" value="OP-001"></div>
+              <div class="operator-field"><label for="operator-input">测试操作员（登录账号）</label><input id="operator-input" readonly title="由当前登录账号自动记录，不能手工修改"></div>
               <button class="btn btn-primary btn-large" id="start-test" disabled><span>开始测试</span><kbd>F2</kbd></button>
               <button class="btn btn-ghost btn-block" id="reset-test">清空 / 下一台</button>
               <div class="mes-state" id="run-mes-state"><span>MES 状态</span><strong>等待生成报告</strong></div>
@@ -127,10 +159,11 @@
                 <div class="field"><label for="draft-model">产品型号</label><input id="draft-model" data-draft-field="product_model"></div>
                 <div class="version-box"><span>已保存版本</span><strong id="draft-version">未保存</strong></div>
               </div>
-              <div class="editor-section-heading"><div><h3>测试步骤</h3><p>步骤按顺序执行；每个步骤可配置协议、超时、重试与失败策略。</p></div><button class="btn btn-small btn-secondary" id="add-step">+ 添加测试项</button></div>
+              <div class="editor-section-heading"><div><h3>测试步骤</h3><p>拖动画布节点组合逻辑，或切换为步骤列表；保存时统一编译。</p></div><div class="editor-heading-actions"><div class="editor-mode-switch"><button class="active" data-editor-mode="visual">图形画布</button><button data-editor-mode="list">步骤列表</button></div><button class="btn btn-small btn-secondary" id="add-step">+ 添加测试项</button></div></div>
               <div id="validation-results"></div>
-              <div id="steps-container" class="steps-container"></div>
-              <details class="advanced-editor"><summary>高级 JSON 模式 <span>适合批量修改和导入既有流程</span></summary><textarea id="script-json" spellcheck="false"></textarea><button class="btn btn-small btn-secondary" id="apply-script-json">应用 JSON</button></details>
+              <div id="react-flow-editor" class="react-flow-editor"></div>
+              <div id="steps-container" class="steps-container" hidden></div>
+              <details class="advanced-editor"><summary>高级 JSON 模式 <span>画布与列表最终都生成同一份 JSON</span></summary><textarea id="script-json" spellcheck="false"></textarea><button class="btn btn-small btn-secondary" id="apply-script-json">应用 JSON</button></details>
             </article>
           </div>
         </section>
@@ -179,16 +212,51 @@
         <section class="page" id="page-reports">
           <div class="page-toolbar"><div><h2>测试报告中心</h2><p>每份报告仅对应一个 SN，保留测试快照与完整 MES 上传记录。</p></div></div>
           <article class="card">
-            <form id="report-filter" class="report-filters"><div class="field search-field"><label for="report-sn">SN 搜索</label><input id="report-sn" placeholder="输入完整或部分 SN"></div><div class="field"><label for="report-status">测试结果</label><select id="report-status"><option value="">全部结果</option><option value="PASS">PASS</option><option value="FAIL">FAIL</option></select></div><div class="field"><label for="report-mes">MES 状态</label><select id="report-mes"><option value="">全部状态</option><option value="PENDING">待上传</option><option value="SUCCESS">上传成功</option><option value="FAILED">上传失败</option></select></div><button class="btn btn-secondary" type="submit">查询报告</button></form>
+            <form id="report-filter" class="report-filters"><div class="field search-field"><label for="report-sn">SN 搜索</label><input id="report-sn" placeholder="输入完整或部分 SN"></div><div class="field"><label for="report-status">测试结果</label><select id="report-status"><option value="">全部结果</option><option value="PASS">PASS</option><option value="FAIL">FAIL</option></select></div><div class="field" data-admin-only><label for="report-mes">MES 状态</label><select id="report-mes"><option value="">全部状态</option><option value="PENDING">待上传</option><option value="SUCCESS">上传成功</option><option value="FAILED">上传失败</option></select></div><button class="btn btn-secondary" type="submit">查询报告</button></form>
             <div class="table-wrap"><table class="data-table"><thead><tr><th>报告编号</th><th>SN / 产品型号</th><th>脚本</th><th>完成时间</th><th>测试结果</th><th>MES 状态</th><th>操作</th></tr></thead><tbody id="reports-table"></tbody></table></div>
             <div class="table-footer"><span id="reports-total">共 0 份报告</span></div>
           </article>
+        </section>
+
+        <section class="page" id="page-users" data-admin-only>
+          <div class="page-toolbar"><div><h2>账号与角色权限</h2><p>管理员拥有全部功能；操作工只能扫码、执行测试和查看测试结果。</p></div></div>
+          <div class="role-summary-grid">
+            <article class="role-summary"><span class="role-icon admin">AD</span><div><strong>管理员</strong><p>流程编排、通讯配置、MES、账号管理、生产测试及报告操作。</p></div></article>
+            <article class="role-summary"><span class="role-icon operator">OP</span><div><strong>操作工</strong><p>仅可扫码、开始测试、查看运行状态和测试报告，不可修改任何配置。</p></div></article>
+          </div>
+          <div class="users-layout">
+            <article class="card user-create-card">
+              <div class="card-header"><div><span class="eyebrow">NEW ACCOUNT</span><h2>新建用户</h2></div></div>
+              <form id="user-form" class="user-form">
+                <div class="field"><label for="new-username">用户名</label><input id="new-username" autocomplete="off" placeholder="字母开头，2~32 位" required></div>
+                <div class="field"><label for="new-display-name">显示名称</label><input id="new-display-name" placeholder="例如：一班操作员" required></div>
+                <div class="field"><label for="new-role">角色</label><select id="new-role"><option value="operator">操作工</option><option value="admin">管理员</option></select></div>
+                <div class="field"><label for="new-password">初始密码</label><input id="new-password" type="password" autocomplete="new-password" minlength="8" placeholder="至少 8 位" required></div>
+                <button class="btn btn-primary btn-block" type="submit">创建用户</button>
+              </form>
+            </article>
+            <article class="card users-card">
+              <div class="card-header"><div><span class="eyebrow">ACCESS CONTROL</span><h2>用户列表</h2></div><span id="user-count" class="count-badge">0</span></div>
+              <div class="table-wrap"><table class="data-table"><thead><tr><th>用户</th><th>角色</th><th>状态</th><th>更新时间</th><th>操作</th></tr></thead><tbody id="users-table"></tbody></table></div>
+            </article>
+          </div>
         </section>
       </div>
     </main>
   </div>
 
   <div class="modal-backdrop" id="report-modal" hidden><div class="modal report-modal" role="dialog" aria-modal="true" aria-labelledby="report-modal-title"><div id="report-modal-content"></div></div></div>
+  <div class="modal-backdrop" id="password-modal" hidden>
+    <div class="modal password-modal" role="dialog" aria-modal="true" aria-labelledby="password-modal-title">
+      <div class="card-header"><div><span class="eyebrow">ACCOUNT SECURITY</span><h2 id="password-modal-title">修改我的密码</h2></div><button class="modal-close" data-close-password aria-label="关闭">×</button></div>
+      <form id="password-form" class="password-form">
+        <div class="field"><label for="current-password">当前密码</label><input id="current-password" type="password" autocomplete="current-password" required></div>
+        <div class="field"><label for="new-own-password">新密码</label><input id="new-own-password" type="password" autocomplete="new-password" minlength="8" placeholder="8~128 位" required></div>
+        <div class="field"><label for="confirm-own-password">确认新密码</label><input id="confirm-own-password" type="password" autocomplete="new-password" minlength="8" required></div>
+        <div class="form-actions"><button class="btn btn-primary" type="submit">保存新密码</button><button class="btn btn-ghost" type="button" data-close-password>取消</button></div>
+      </form>
+    </div>
+  </div>
   <div class="toast-container" id="toast-container" aria-live="polite"></div>
 </body>
 </html>

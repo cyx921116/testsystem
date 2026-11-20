@@ -12,6 +12,9 @@ def field(
     required: bool = False,
     options: list[dict[str, Any]] | None = None,
     placeholder: str = "",
+    group: str = "connection",
+    help: str = "",
+    depends_on: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     return {
         "key": key,
@@ -21,6 +24,9 @@ def field(
         "required": required,
         "options": options or [],
         "placeholder": placeholder,
+        "group": group,
+        "help": help,
+        "depends_on": depends_on or {},
     }
 
 
@@ -51,22 +57,21 @@ PROTOCOL_DEFINITIONS: dict[str, dict[str, Any]] = {
     },
     "can": {
         "label": "CAN 总线",
-        "description": "支持 python-can 已适配的 PCAN、SocketCAN、Kvaser 等接口。",
+        "description": "支持 python-can 已适配的 PCAN、SocketCAN、Kvaser 等接口；ID 和数据均按十进制编辑。",
         "fields": [
             field("interface", "驱动接口", default="pcan", required=True, placeholder="pcan / socketcan / kvaser"),
             field("channel", "通道", default="PCAN_USBBUS1", required=True),
             field("bitrate", "波特率", "number", 500000),
-            field("arbitration_id", "发送仲裁 ID", default="0x701"),
-            field("response_id", "响应仲裁 ID（留空不过滤）", default="0x709"),
+            field("arbitration_id", "发送仲裁 ID（十进制）", "number", 1793),
+            field("response_id", "响应仲裁 ID（十进制，0 不过滤）", "number", 1801),
             field("extended_id", "扩展帧", "checkbox", False),
             field("can_fd", "CAN FD", "checkbox", False),
             field("timeout_ms", "读取超时（毫秒）", "number", 1500),
-            field("response_format", "响应格式", "select", "hex", options=[{"value": "hex", "label": "HEX"}, {"value": "text", "label": "文本"}]),
         ],
     },
     "tcp": {
         "label": "TCP",
-        "description": "标准 TCP Client，支持文本、HEX 和 JSON 数据。",
+        "description": "标准 TCP Client，支持文本指令和可配置的十进制二进制数据。",
         "fields": [
             field("host", "服务器地址", default="192.168.1.100", required=True),
             field("port", "端口", "number", 5025, required=True),
@@ -140,6 +145,76 @@ PROTOCOL_DEFINITIONS: dict[str, dict[str, Any]] = {
         ],
     },
 }
+
+
+VALUE_TYPE_OPTIONS = [
+    {"value": value, "label": label}
+    for value, label in [
+        ("uint8", "无符号 8 位整数"),
+        ("int8", "有符号 8 位整数"),
+        ("uint16", "无符号 16 位整数"),
+        ("int16", "有符号 16 位整数"),
+        ("uint32", "无符号 32 位整数"),
+        ("int32", "有符号 32 位整数"),
+        ("float32", "32 位浮点数"),
+        ("float64", "64 位浮点数"),
+    ]
+]
+BYTE_ORDER_OPTIONS = [
+    {"value": "big", "label": "大端（高字节在前）"},
+    {"value": "little", "label": "小端（低字节在前）"},
+]
+
+
+def codec_fields(send_format: str, receive_format: str) -> list[dict[str, Any]]:
+    decimal_send = {"key": "send_format", "value": "decimal"}
+    decimal_receive = {"key": "receive_format", "value": "decimal"}
+    return [
+        field(
+            "send_format", "下发数据格式", "select", send_format,
+            options=[
+                {"value": "text", "label": "文本指令"},
+                {"value": "decimal", "label": "十进制数值 → 二进制"},
+                {"value": "json", "label": "JSON 文本"},
+            ],
+            group="downlink",
+        ),
+        field("send_type", "数值类型", "select", "uint16", options=VALUE_TYPE_OPTIONS, group="downlink", depends_on=decimal_send),
+        field("send_byte_order", "字节序", "select", "big", options=BYTE_ORDER_OPTIONS, group="downlink", depends_on=decimal_send),
+        field(
+            "send_scale", "下发缩放系数", "number", 1, group="downlink", depends_on=decimal_send,
+            help="实际写入值 = 页面十进制输入 × 此系数；多个数值可用逗号分隔。",
+        ),
+        field(
+            "receive_format", "响应解析格式", "select", receive_format,
+            options=[
+                {"value": "text", "label": "文本"},
+                {"value": "decimal", "label": "二进制 → 十进制数值"},
+                {"value": "json", "label": "JSON"},
+                {"value": "hex", "label": "原始 HEX（诊断）"},
+            ],
+            group="uplink",
+        ),
+        field("receive_type", "数值类型", "select", "uint16", options=VALUE_TYPE_OPTIONS, group="uplink", depends_on=decimal_receive),
+        field("receive_byte_order", "字节序", "select", "big", options=BYTE_ORDER_OPTIONS, group="uplink", depends_on=decimal_receive),
+        field("receive_offset", "起始字节偏移", "number", 0, group="uplink", depends_on=decimal_receive),
+        field("receive_length", "解析字节数（0 为全部）", "number", 0, group="uplink", depends_on=decimal_receive),
+        field(
+            "receive_scale", "响应缩放系数", "number", 1, group="uplink", depends_on=decimal_receive,
+            help="页面和断言使用的数值 = 解析值 × 此系数，例如原始值 1200 可缩放为 12.0。",
+        ),
+    ]
+
+
+for protocol_name, send_default, receive_default in [
+    ("serial", "text", "text"),
+    ("can", "decimal", "decimal"),
+    ("tcp", "text", "text"),
+    ("wifi", "text", "text"),
+    ("bluetooth", "text", "text"),
+    ("mqtt", "text", "text"),
+]:
+    PROTOCOL_DEFINITIONS[protocol_name]["fields"].extend(codec_fields(send_default, receive_default))
 
 
 DEFAULT_PROTOCOL_CONFIGS = {

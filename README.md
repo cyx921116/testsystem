@@ -1,10 +1,11 @@
 # Pilot 生产测试系统
 
-一个可直接运行的生产测试工作站，包含产品 SN 追溯、低代码测试流程、逐项 PASS/FAIL 展示、唯一测试报告、可配置 MES 上传，以及多协议产品通讯。
+一个可直接运行的生产测试工作站，包含产品 SN 追溯、管理员/操作工权限、直观低代码测试流程、逐项 PASS/FAIL 展示、唯一测试报告、可配置 MES 上传，以及多协议产品通讯。低代码数值统一使用十进制，协议层可配置二进制编解码。
 
 ## 文档
 
-- [详细项目开发说明](docs/PROJECT_GUIDE.md)：架构、目录、数据库、全部后端函数、前端函数、脚本、协议、MES、API 和扩展方法。
+- [详细项目开发说明](docs/PROJECT_GUIDE.md)：架构、目录、数据库、后端函数、前端函数、脚本、协议、MES、API 和扩展方法。
+- [控制流与 React Flow 开发说明](docs/CONTROL_FLOW.md)：条件、并行、循环、子流程、v2 JSON、执行语义和前端构建。
 - [Git 与 GitHub 配置指南](docs/GIT_GITHUB.md)：Windows 环境、提交身份、登录授权、创建仓库、推送和常见问题。
 
 ## 启动
@@ -17,6 +18,15 @@ uv run testsystem
 ```
 
 打开 <http://127.0.0.1:8000>。API 文档位于 <http://127.0.0.1:8000/docs>。
+
+首次启动创建以下账号，密码使用 PBKDF2 加盐哈希保存，登录会话通过 HttpOnly Cookie 保持 12 小时：
+
+| 角色 | 初始账号 | 初始密码 | 权限 |
+| --- | --- | --- | --- |
+| 管理员 | `admin` | `admin123` | 全部功能、账号管理、MES 上传与生产测试 |
+| 操作工 | `operator` | `operator123` | 扫码、执行测试、查看运行与报告 |
+
+首次登录后请立即修改密码。可在首次初始化前通过 `TESTSYSTEM_ADMIN_PASSWORD`、`TESTSYSTEM_OPERATOR_PASSWORD` 指定不同的初始密码；已存在的账号不会被环境变量重置。HTTPS 部署时设置 `TESTSYSTEM_SECURE_COOKIE=true`。
 
 也可以用 `uv run uvicorn testsystem.app:app --reload` 开发调试。生产运行请使用单进程；不要使用多个 Uvicorn worker 共用同一个物理工位。
 
@@ -43,13 +53,35 @@ uv run testsystem
 
 ## 低代码流程
 
-“流程编排”支持：
+“流程编排”现在使用 React Flow 复杂图形画布，支持：
 
-- 添加、删除、上下移动测试项；
-- 每个测试项独立选择通讯协议、超时、失败重试次数和失败后的停止/继续策略；
-- 组合发送并等待响应、仅发送、接收、设备操作、变量赋值、断言、延时动作；
-- 使用 JSON 高级模式批量编辑；
+- `test` 测试项：组合请求、接收、设备操作、变量、断言和延时；
+- `condition` 条件判断：按断言结果选择 TRUE/FALSE 分支；
+- `parallel` 并行执行：2~8 路分支，独立上下文和协议连接；
+- `loop` 循环：固定次数或 while 条件，最多 100 次；
+- `subflow` 子流程/子任务：复用独立流程、传递输入并读取输出；
+- 条件 TRUE/FALSE 和循环体可添加任意类型节点；
+- 并行分支支持名称、ID、排序、增删和分支内嵌套编辑；
+- 子任务支持新建、调用节点跳转编辑，以及删除前引用检查；
+- 节点拖入、同层拖动重排、缩放、小地图和右侧属性检查器；
+- 测试项一键复制、动作上下排序、全类型动作添加器和常用寄存器参数具名表单；
+- 数值断言使用独立的十进制上下限，发送动作不再要求选择 HEX/JSON 编码；
+- 主流程与多个子流程切换编辑；
+- 传统步骤列表和高级 JSON；所有编辑方式共用同一份流程草稿；
 - 保存前由后端编译校验，保存后版本自动递增。
+
+从左侧拖入控制节点，点击节点编辑条件、分支、循环和动作。子流程输出通过 `${subflows.调用节点ID.变量名}` 访问，并行分支输出通过 `${branches.分支ID.变量名}` 访问。详细结构见 [控制流说明](docs/CONTROL_FLOW.md)。
+
+### 前端构建
+
+仓库已经包含构建后的 `flow-editor.js` 和 `flow-editor.css`，正常运行系统不需要 Node.js。只有修改 `src/testsystem/frontend` 中的 React/TypeScript 源码时才需要：
+
+```bash
+npm ci
+npm run build
+```
+
+`npm run build` 先执行 TypeScript 类型检查，再用 Vite 构建到 FastAPI 静态目录。生产部署仍只需要 Python 和浏览器。
 
 脚本使用受限 JSON 结构，不执行任意 Python 代码。模板变量格式为 `${sn}`、`${station}`、`${run_id}`、`${response}`；列表可用 `${registers.0}` 访问。发送数据和期望值都支持模板替换。
 
@@ -64,7 +96,7 @@ uv run testsystem
   "retries": 1,
   "on_fail": "stop",
   "actions": [
-    {"type": "request", "data": "AT+VOLTAGE?\r\n", "encoding": "text", "save_as": "voltage"},
+    {"type": "request", "data": "AT+VOLTAGE?\r\n", "save_as": "voltage"},
     {"type": "assert", "actual": "${voltage}", "operator": "between", "expected": [11.5, 12.5]}
   ]
 }
@@ -91,6 +123,24 @@ uv sync --extra hardware
 | J-Link | 通过 pylink-square 与 J-Link 连接，读写内存/寄存器及复位控制 |
 
 “通讯配置”页面可保存参数并测试连接。真实硬件测试需要相应厂商驱动，例如 CAN 适配器驱动或 SEGGER J-Link Software。WiFi 配置负责已建立网络后的 TCP 通讯，不负责修改操作系统无线网络。
+
+### 十进制数据与协议编解码
+
+低代码编辑器中的 ID、地址、寄存器值和断言数值均按十进制填写。文本指令（如 `AT+SN?`）仍可直接填写；多个十进制字节或寄存器值使用逗号分隔，例如 `1, 3, 1200`。不要在低代码输入框中填写 `0x...`。
+
+串口、CAN、TCP、WiFi、BLE、MQTT 的配置页分为“连接参数 / 下发编码 / 响应解析”：
+
+| 配置 | 作用 |
+| --- | --- |
+| `send_format` | `text` 文本、`decimal` 十进制转二进制、`json` JSON 文本 |
+| `send_type` / `send_byte_order` | 下发整数或浮点类型、大小端 |
+| `send_scale` | 实际发送值 = 页面输入 × 缩放系数 |
+| `receive_format` | 文本、十进制数值、JSON，或诊断用原始 HEX |
+| `receive_type` / `receive_byte_order` | 响应数值类型和大小端 |
+| `receive_offset` / `receive_length` | 跳过报文头并限制解析字节数，0 表示解析剩余全部 |
+| `receive_scale` | 断言使用的数值 = 原始解析值 × 缩放系数 |
+
+例如 `1200` 按 `uint16 + 大端` 下发为 `04 B0`；响应 `04 B0` 配置 `receive_scale=0.01` 后得到十进制 `12.0`。旧脚本动作中的 `encoding: text/hex/json` 仍由后端兼容，新动作省略 `encoding` 并继承协议配置。
 
 Modbus 和 J-Link 使用 `execute` 动作。例如读取保持寄存器：
 
@@ -148,5 +198,6 @@ Modbus 和 J-Link 使用 `execute` 动作。例如读取保持寄存器：
 
 - SQLite 启用外键和 WAL；SN、运行和报告均有唯一约束，工位同时只允许一个活动测试。
 - 报告保存脚本快照，确保后续编辑不影响历史追溯。
-- 默认无登录鉴权，适合隔离的产线内网单机部署。跨终端或暴露到非可信网络前，应在反向代理增加 TLS、认证和访问控制。
+- 内置登录和管理员/操作工角色，所有 API 均由后端鉴权；操作工不能修改脚本、协议、MES、用户或上传报告。
+- 默认仍建议部署在受信产线内网。跨终端或暴露到非可信网络前，应使用 HTTPS、修改初始密码并限制数据目录访问；Cookie 本身不替代 TLS。
 - MES 密码、MQTT 密码等保存在本地配置数据库中，请限制数据目录访问权限并纳入受控备份。

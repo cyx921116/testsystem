@@ -14,15 +14,16 @@
 6. 报告可查询、打印、下载，并通过可配置 HTTP 报文上传 MES。
 7. 串口、CAN、TCP、Modbus、BLE、WiFi、MQTT、J-Link 使用统一协议接口。
 8. 默认内置产品仿真器，无硬件也能验证完整业务流程。
+9. v2 控制流支持条件、并行、循环和可复用子流程，复杂画布使用 React Flow。
 
-当前版本适合隔离产线内网中的单进程、单工位部署。它不是已经完成用户权限、电子签名、审计审批和多工位调度的大型 MES，而是一个可继续扩展的生产测试执行系统。
+当前版本适合隔离产线内网中的单进程、单工位部署，已提供登录、管理员/操作工后端权限、账号管理和会话失效控制。它仍不是包含电子签名、审计审批和多工位调度的大型 MES，而是一个可继续扩展的生产测试执行系统。
 
 ## 2. 总体架构
 
 ```text
 ┌─────────────────────────────────────────────────────────────┐
-│ 浏览器：原生 HTML + CSS + JavaScript                        │
-│ 生产测试 / 流程编排 / 通讯配置 / MES 集成 / 报告中心         │
+│ 浏览器：原生 JavaScript + React Flow 编辑器岛               │
+│ 生产测试 / 复杂流程编排 / 通讯配置 / MES 集成 / 报告中心     │
 └──────────────────────────┬──────────────────────────────────┘
                            │ HTTP JSON API
 ┌──────────────────────────▼──────────────────────────────────┐
@@ -61,16 +62,11 @@ SQLite 随 Python 自带，无需额外数据库服务，适合单工位工作�
 
 如果以后需要多工位集中管理、网页远程访问、多用户权限或高并发查询，建议把数据访问层迁移到 PostgreSQL，并把执行器留在各工位边缘服务中。
 
-### 2.2 为什么前端不使用框架
+### 2.2 混合前端架构
 
-当前前端只有原生 HTML、CSS 和 JavaScript：
+生产测试、通讯配置、MES 和报告页面继续使用原生 HTML、CSS 和 JavaScript，状态集中在 `state` 对象中。复杂流程编辑器使用 React + TypeScript + React Flow，以“编辑器岛”挂载到现有页面。
 
-- 不需要 Node.js 构建步骤。
-- FastAPI 可以直接托管静态文件。
-- 适合内网工控机，部署依赖少。
-- 页面状态集中在一个 `state` 对象中，逻辑清晰。
-
-如果未来流程编辑器需要拖拽画布、复杂协作或大量组件，可迁移到 Vue/React；后端 API 不需要因此改变。
+这种方案避免全站重写，同时支持条件、并行、循环和子流程。Node.js 只负责开发构建，Vite 产物由 FastAPI 托管，产线运行仍只需要 Python 和浏览器。构建后的 JS/CSS 随 wheel 发布，不依赖外部 CDN。详见 [控制流与 React Flow 开发说明](CONTROL_FLOW.md)。
 
 ## 3. 目录和文件职责
 
@@ -79,27 +75,44 @@ Testsystem/
 ├── .gitattributes             Git 跨平台换行和二进制文件规则
 ├── .gitignore                 排除数据库、密钥、虚拟环境和缓存
 ├── .python-version            指定 Python 3.12
-├── pyproject.toml             项目元数据、依赖、可选硬件依赖、启动命令
-├── uv.lock                    uv 解析后的依赖锁文件
+├── pyproject.toml             Python 项目元数据、依赖和启动命令
+├── uv.lock                    Python 依赖锁文件
+├── package.json               React、React Flow、Vite 和构建命令
+├── package-lock.json          npm 依赖锁文件
+├── tsconfig.json              TypeScript 严格检查配置
+├── vite.config.ts             React 编辑器库构建配置
 ├── README.md                  快速启动和常用配置
 ├── docs/
 │   ├── PROJECT_GUIDE.md       本详细开发说明
+│   ├── CONTROL_FLOW.md        v2 控制流、执行语义和 React 构建
 │   └── GIT_GITHUB.md          Git、GitHub 登录与上传指南
 └── src/
     ├── main.py                兼容直接运行该脚本时调用系统入口
     └── testsystem/
         ├── __init__.py        `uv run testsystem` 的主入口
-        ├── app.py             FastAPI 应用、API、请求模型、静态页面
-        ├── compiler.py        低代码 JSON 的校验和规范化
-        ├── database.py        SQLite 表结构、默认配置、连接和事务
-        ├── executor.py        测试执行、断言、重试、报告生成
+        ├── app.py             FastAPI 应用、API、权限中间件、静态页面
+        ├── auth.py            用户、密码哈希、签名会话和角色 API
+        ├── data_codec.py      十进制数值与协议二进制编解码
+        ├── compiler.py        v1 校验和 v2 编译入口
+        ├── control_compiler.py 条件、并行、循环、子流程的递归校验
+        ├── database.py        SQLite 表结构、迁移、默认配置、连接和事务
+        ├── executor.py        运行生命周期、v1 执行、报告定稿
+        ├── control_flow.py    v2 递归执行、并行、循环和控制事件
         ├── mes.py             MES 报文构造、HTTP 上传、上传日志
         ├── protocols.py       各通讯协议适配器
         ├── protocol_definitions.py 协议字段元数据和默认连接参数
         ├── utils.py           时间、ID、JSON、模板变量工具
+        ├── frontend/
+        │   ├── FlowEditor.tsx React Flow 组件、拖放、检查器和挂载 API
+        │   ├── model.ts       v2 AST 创建、路径更新和重排
+        │   ├── types.ts       控制流 TypeScript 类型
+        │   └── flow-editor.css React 编辑器样式
         └── static/
-            ├── index.html     全部页面结构和弹窗容器
+            ├── index.html     全部页面结构和 React 挂载容器
             ├── styles.css     工业风界面、响应式布局、打印样式
+            ├── flow-model.js  旧顺序列表的纯数据模型
+            ├── flow-editor.js React Flow 构建产物
+            ├── flow-editor.css React Flow 构建样式
             └── app.js         前端状态、API 调用、交互和渲染
 ```
 
@@ -212,7 +225,9 @@ Python 包不等于全部硬件驱动。例如 PCAN 还需要厂商驱动，J-Li
 uv build
 ```
 
-构建生成源码包和 wheel。前端 `index.html`、`app.js`、`styles.css` 也属于 Python wheel 内容，否则安装包会只有 API 没有页面。当前构建已检查这些资源会被包含。
+构建生成源码包和 wheel。前端 `index.html`、`app.js`、`styles.css`、React 构建产物也属于 Python wheel 内容，否则安装包会只有 API 没有页面。
+
+修改 React/TypeScript 源码后，先执行 `npm ci` 和 `npm run build`。该命令先进行 TypeScript 严格检查，再由 Vite 生成 `static/flow-editor.js` 和 `flow-editor.css`。`package-lock.json` 保证 npm 依赖可复现，`node_modules/` 不提交。正常运行和安装 wheel 不需要 Node.js。
 
 ## 6. 数据库详细设计
 
@@ -262,6 +277,11 @@ uv build
 - `sn_pattern`：SN 正则表达式。
 - `auto_upload`：报告生成后是否自动上传 MES。
 - `mes`：MES 地址、方法、请求头、报文映射等完整 JSON。
+- `auth_secret`：仅用于签名登录 Cookie 的本地随机密钥，不通过工位设置 API 返回。
+
+### 6.4.1 `users`：登录账号与角色
+
+保存用户名、显示名称、`admin/operator` 角色、随机盐、PBKDF2-HMAC-SHA256 密码哈希、启用状态和会话版本。修改或重置密码、启停账号会递增会话版本，使旧 Cookie 失效。默认账号只在首次初始化时创建，重启不会重置密码。数据库中不保存明文密码。
 
 ### 6.5 `test_runs`：一次测试运行
 
@@ -302,6 +322,8 @@ ON test_runs(station) WHERE status = 'RUNNING';
 
 前序步骤设置为 `stop` 且失败时，后续步骤会记录为 FAIL，消息为“前序测试失败，本项未执行”，从而保证报告中每项都明确是 PASS 或 FAIL。
 
+v2 另外增加 `node_id`、`path` 和 `iteration`。`item_id` 表示一次实际执行的唯一路径，`node_id` 表示脚本中的逻辑节点；循环项通过路径中的迭代序号避免覆盖。v2 只记录实际到达的执行项，未选分支和未发生的迭代不创建记录。
+
 ### 6.7 `reports`：一对一正式报告
 
 最重要的约束：
@@ -338,12 +360,17 @@ report_no TEXT NOT NULL UNIQUE
 - `response`：MES 响应或异常。
 - `created_at`：上传时间。
 
-### 6.9 表关系
+### 6.9 `control_events`：v2 控制事件
+
+记录条件、并行、循环和子流程调用。字段包括节点 ID、名称、类型、执行路径、状态、JSON 明细和起止时间。状态为 RUNNING、TRUE、FALSE、PASS、FAIL 或 INTERRUPTED。条件 FALSE 是正常分支结果，不会误判为测试失败。启动时自动创建该表，并为旧 test_items 补充 v2 字段。
+
+### 6.10 表关系
 
 ```text
 products 1 ──────── N test_runs
 scripts  1 ──────── N test_runs
 test_runs 1 ─────── N test_items
+test_runs 1 ─────── N control_events
 test_runs 1 ─────── 0..1 reports
 products 1 ─────── 0..1 reports
 reports  1 ─────── N mes_upload_logs
@@ -546,13 +573,14 @@ steps[2].actions[1].expected
 
 `_as_int(value)`：同时接受数字和字符串，支持 `0x701` 这类十六进制输入。
 
-`_encode(data, encoding, charset)`：
+`BaseProtocol.encode_data()` / `decode_data()` 调用 `data_codec.py`：
 
-- `text`：按字符编码转换为字节。
-- `hex`：把 HEX 字符串转换为字节。
-- `json`：JSON 序列化后编码。
+- `text`：按字符编码转换文本指令。
+- `decimal`：用 `struct` 按 uint/int/float 类型和大小端转换十进制数值，支持多个值、偏移、长度和缩放。
+- `json`：JSON 序列化或解析。
+- `hex`：保留给旧动作和响应诊断使用，低代码新建动作不再提供 HEX 输入。
 
-`_decode(data, charset, response_format)`：接收字节转文本或带空格的十六进制字符串；文本解码错误使用替换字符，避免单个非法字节导致整个测试崩溃。
+旧 `_encode()` / `_decode()` 以及动作中的 `encoding` 字段仅用于兼容既有脚本。新动作不带 `encoding` 时，执行器把 `None` 传给协议适配器，由该协议的 `send_*`、`receive_*` 配置决定实际格式。
 
 ### `ProtocolError`
 
@@ -622,7 +650,7 @@ WiFi 复用该类，只额外保存 SSID 等追溯信息。它不负责修改 Wi
 - `receive()`：在总超时内循环读取；配置 `response_id` 时过滤其他帧。
 - `close()`：关闭总线。
 
-数据通常使用 HEX 编码。实际 CANopen、UDS 等上层协议可在动作组合或新适配器中扩展，本类提供的是 CAN 帧收发基础。
+新流程的 CAN ID 和数据均按十进制编辑，默认按 `uint16 + 大端` 编解码，可在协议配置中修改。旧 HEX 动作仍可执行。实际 CANopen、UDS 等上层协议可在动作组合或新适配器中扩展，本类提供 CAN 帧收发基础。
 
 ### `ModbusProtocol`
 
@@ -847,7 +875,13 @@ WiFi 复用该类，只额外保存 SSID 等追溯信息。它不负责修改 Wi
 - HTTPError 保留服务端响应，URLError 转成网络错误。
 - HTTPS 默认校验证书；`verify_tls=false` 仅适合受控调试，不建议生产使用。
 
-## 7.8 `app.py`：API 和页面入口
+## 7.8 `auth.py`：登录与角色权限
+
+`AuthService` 负责默认账号初始化、PBKDF2 密码校验、HMAC 签名 Cookie、12 小时会话、用户启停和密码重置。`create_auth_router()` 提供 `/api/auth/login`、`logout`、`me`、`password` 及管理员用户管理 API。
+
+`app.py` 的 `authenticate_request` 中间件对除健康检查和登录以外的 `/api` 请求鉴权。操作工只允许读取测试所需流程、工位、运行和报告，以及调用扫码和开始测试接口；其他写操作和配置接口全部要求管理员。开始测试时操作员直接取登录用户名，忽略客户端伪造的 operator 字段。
+
+## 7.9 `app.py`：API 和页面入口
 
 ### 请求模型
 
@@ -955,10 +989,11 @@ Pydantic 在业务函数之前拒绝缺失或类型明显错误的请求。
 
 ### 侧边栏和顶部栏
 
-- `.sidebar`：品牌、当前工位、五个主导航、后端连接状态。
-- `.topbar`：页面标题、说明、本地时间和 PRODUCTION 标识。
+- 登录页：账号密码登录、角色说明和默认账号快捷填充。
+- `.sidebar`：品牌、当前工位、六个主导航、当前用户、修改密码和退出入口。
+- `.topbar`：页面标题、说明、本地时间、当前角色和 PRODUCTION 标识。
 
-导航通过 `data-page` 与五个 `<section>` 对应，不依赖第三方路由。
+导航通过 `data-page` 与六个 `<section>` 对应，不依赖第三方路由。操作工只显示生产测试和报告中心，管理页面同时由前端隐藏、导航拦截和后端中间件保护。
 
 ### 生产测试页 `#page-production`
 
@@ -969,7 +1004,7 @@ Pydantic 在业务函数之前拒绝缺失或类型明显错误的请求。
 - 进度：`#run-progress`、`#overall-badge`。
 - 测试项表格：`#test-items`。
 - 当前产品：`#unit-sn`、`#unit-model`、`#unit-station` 等。
-- 操作员：`#operator-input`。
+- 操作员：`#operator-input`，只读展示当前登录账号，后端启动运行时强制使用会话用户名。
 - 开始与清空：`#start-test`、`#reset-test`。
 - 最近报告：`#recent-reports`。
 
@@ -1264,6 +1299,31 @@ PUT 保存当前协议，更新本地配置和 JSON 编辑器。
 5. 恢复活动运行。
 6. 根据 URL hash 打开对应页面。
 
+## 8.10 React Flow 复杂图形编辑器
+
+复杂画布现在使用 React + TypeScript + React Flow，源码位于 `src/testsystem/frontend`，支持五类节点：test、condition、parallel、loop 和 subflow。节点采用递归 AST，画布由 AST 生成，保存时仍使用原来的 `state.draft` 和脚本 API。
+
+### 页面区域
+
+- 节点库：拖入测试、条件、并行、循环和子流程调用。
+- React Flow 画布：条件 TRUE/FALSE 分支、并行分支汇聚、循环回边、缩放和小地图。
+- 属性检查器：编辑节点、条件、分支、循环参数、子流程输入和七类动作。
+- 子流程切换：主流程与多个可复用子流程分别编辑。
+- 步骤列表和高级 JSON：与 React 编辑器共享草稿。
+
+### React 源码职责
+
+- `FlowEditor.tsx`：React Flow 节点、Dagre 布局、拖放、子流程切换、属性检查器和全局挂载。
+- `model.ts`：v2 默认节点、不可变路径更新、插入、删除和同层重排。
+- `types.ts`：递归节点定义和界面标签。
+- `flow-editor.css`：React Flow 和检查器样式。
+
+`PilotFlowEditor.mount()` 把编辑器挂载到现有页面；`setDefinition()` 同步原页面草稿。React 的 `onChange` 只更新 `state.draft`，保存和编译仍由原页面负责。
+
+旧 `flow-model.js` 继续服务于传统顺序列表。旧的 `renderVisualEditor()` 和 `bindVisualEditor()` 保留为兼容代码，但默认画布由 React 接管。
+
+完整结构、执行语义、构建方式和函数说明见 [控制流与 React Flow 开发说明](CONTROL_FLOW.md)。
+
 ## 9. 低代码脚本完整参考
 
 ## 9.1 顶层结构
@@ -1307,20 +1367,19 @@ PUT 保存当前协议，更新本地配置和 JSON 编辑器。
 {
   "type": "request",
   "data": "AT+VERSION?\r\n",
-  "encoding": "text",
   "save_as": "firmware"
 }
 ```
 
-返回同时写入 `last_response` 和 `firmware`。`encoding` 支持 text、hex、json。
+返回同时写入 `last_response` 和 `firmware`。新动作不填写 `encoding`，由协议配置决定下发格式；旧动作的 `encoding: text/hex/json` 仍兼容。
 
 ### send：只发送
 
 ```json
-{"type": "send", "data": "010300000002", "encoding": "hex"}
+{"type": "send", "data": "1, 3, 0, 2"}
 ```
 
-适合先发后收，或不需要响应的指令。
+适合先发后收，或不需要响应的指令。十进制数据按协议配置的数值类型和字节序下发；文本协议也可以直接填写 AT 等指令。
 
 ### receive：等待接收
 
@@ -1395,7 +1454,7 @@ PUT 保存当前协议，更新本地配置和 JSON 编辑器。
       "retries": 1,
       "on_fail": "stop",
       "actions": [
-        {"type": "request", "data": "AT+SN?\r\n", "encoding": "text", "save_as": "device_sn"},
+        {"type": "request", "data": "AT+SN?\r\n", "save_as": "device_sn"},
         {"type": "assert", "actual": "${device_sn}", "operator": "equals", "expected": "${sn}"}
       ]
     },
@@ -1407,7 +1466,7 @@ PUT 保存当前协议，更新本地配置和 JSON 编辑器。
       "retries": 1,
       "on_fail": "continue",
       "actions": [
-        {"type": "request", "data": "AT+VERSION?\r\n", "encoding": "text", "save_as": "version"},
+        {"type": "request", "data": "AT+VERSION?\r\n", "save_as": "version"},
         {"type": "assert", "actual": "${version}", "operator": "equals", "expected": "${expected_version}"}
       ]
     }
@@ -1449,7 +1508,7 @@ SN 绑定步骤建议同时校验产品返回 SN 与扫码 SN，避免扫了 A �
 
 每个 item 包含：
 
-- `item_id`、`name`、`sequence`。
+- `item_id`、`node_id`、`path`、`iteration`、`name`、`sequence`。
 - `status`、`expected`、`actual`、`message`。
 - `attempts`、`assertions`。
 - `started_at`、`finished_at`、`duration_ms`。
@@ -1589,9 +1648,9 @@ SN 绑定步骤建议同时校验产品返回 SN 与扫码 SN，避免扫了 A �
 2. 数据目录放在可备份、权限受控的磁盘，不要放在源码目录同步盘中。
 3. 定期备份 SQLite，备份时采用 SQLite 在线备份或停止写入，避免直接复制不一致文件。
 4. 只允许受信产线内网访问；跨网段时增加反向代理、TLS 和身份认证。
-5. 当前版本没有用户登录和角色权限，不能直接暴露到公网。
+5. 系统已有登录和角色权限，但仍不应直接暴露到公网；上线前修改所有初始密码，HTTPS 环境启用安全 Cookie。
 6. MQTT、MES 密码存储在本地数据库，必须限制文件访问。
-7. 限制流程编辑权限是上线前的重要增强，否则普通操作员可能修改判定条件。
+7. 流程编辑、协议配置和 MES 上传已由后端限定为管理员权限，不要仅依赖隐藏前端按钮。
 8. 为关键硬件设置断开恢复策略和 watchdog，但不要让 watchdog 删除失败数据。
 9. 实际产品协议应增加样例记录和边界测试：超时、空响应、非法 HEX、错误 SN、重复帧、断线、重试成功等。
 10. 生产升级前先备份数据库，并用仿真流程验证升级版本。
@@ -1609,13 +1668,19 @@ SN 绑定步骤建议同时校验产品返回 SN 与扫码 SN，避免扫了 A �
 - 未扫码直接调用开始 API 被拒绝；正常扫码后测试通过。
 - 同一 SN 重复扫码和重复开始被拦截，数据库只有一份报告。
 - 自定义脚本创建、编辑升到 v2、执行并生成 v2 快照报告。
+- v2 条件 TRUE/FALSE、计数/while 循环、并行、子流程输出、失败继续和循环上限验证。
+- 非法子流程引用、循环调用、控制事件 FAIL 对最终报告的影响验证。
+- React 五类节点工厂、嵌套插入、不可变重排、后端编译及 React Flow 渲染初始化验证。
+- 条件、并行、循环和子任务专用编辑面板渲染，以及子任务递归引用检查验证。
+- 图形数据模型的步骤插入/排序、动作插入/跨项移动、边界检查和不可变性验证。
+- 实际调用前端拖放事件生成流程，再交由后端编译、执行并生成报告。
 - 本地 MES 首次返回 500，报告标记 FAILED；重试返回 201 后标记 SUCCESS。
 - MES 字段映射、幂等请求头、成功后不重复发送和两条上传日志。
 - Windows 下后台结束和 SQLite 临时文件清理。
 
 尚未在真实串口、CAN、Modbus、BLE、MQTT、J-Link 硬件上联调。协议适配代码已提供，但现场仍需验证具体设备驱动、电气连接、产品协议和超时。
 
-当前没有加入独立自动化测试文件，因为原项目没有测试目录；验证通过临时端到端脚本完成。后续正式团队协作时建议把这些场景固化为 pytest，并使用临时数据库和本地 MES mock。
+自动化测试位于 `tests/`，覆盖控制流编译、十进制编解码、协议旧配置迁移、未登录拦截、管理员/操作工权限、用户管理、密码会话失效和操作工完整仿真测试。运行 `uv run pytest`；前端运行 `npm run typecheck` 和 `npm run build`。真实硬件和现场 MES 仍需按设备协议单独联调。
 
 ## 15. 常见问题排查
 

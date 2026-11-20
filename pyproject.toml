@@ -1,6 +1,6 @@
 [project]
 name = "testsystem"
-version = "0.1.0"
+version = "0.3.0"
 description = "生产测试、SN 追溯、低代码流程编排与 MES 上报系统"
 readme = "README.md"
 requires-python = ">=3.12"
