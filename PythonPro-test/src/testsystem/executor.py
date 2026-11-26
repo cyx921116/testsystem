@@ -487,7 +487,8 @@ class TestExecutor:
                 "UPDATE products SET last_tested_at = ? WHERE sn = ?",
                 (finished_at, run["sn"]),
             )
-            connection.execute("DELETE FROM reports WHERE sn = ? AND status = 'FAIL'", (run["sn"],))
+            # 失败报告不再删除：每次测试（含每次复测）都会生成一份独立报告永久留档，
+            # 并各自等待上传 MES，保证失败追溯数据完整。
             connection.execute(
                 "INSERT INTO reports(id, report_no, sn, run_id, product_model, station, operator, script_name, "
                 "script_version, status, summary_json, report_json, started_at, finished_at, duration_ms) "

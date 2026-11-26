@@ -148,7 +148,8 @@ CREATE INDEX IF NOT EXISTS idx_control_events_run ON control_events(run_id, id);
 CREATE TABLE IF NOT EXISTS reports (
     id TEXT PRIMARY KEY,
     report_no TEXT NOT NULL UNIQUE,
-    sn TEXT NOT NULL UNIQUE,
+    -- 一个 SN 允许保留多份报告：每次测试（含每次失败复测）各存一份，失败数据永不清除
+    sn TEXT NOT NULL,
     run_id TEXT NOT NULL UNIQUE,
     product_model TEXT NOT NULL,
     station TEXT NOT NULL,
@@ -171,6 +172,7 @@ CREATE TABLE IF NOT EXISTS reports (
 
 CREATE INDEX IF NOT EXISTS idx_reports_finished ON reports(finished_at DESC);
 CREATE INDEX IF NOT EXISTS idx_reports_mes ON reports(mes_status);
+CREATE INDEX IF NOT EXISTS idx_reports_sn ON reports(sn);
 
 CREATE TABLE IF NOT EXISTS mes_upload_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -258,6 +260,61 @@ DEFAULT_FLASHER_CONFIG = {
 }
 
 
+# 旧版本 reports.sn 带 UNIQUE 约束（一个 SN 只保留一份报告，复测会覆盖删除失败报告）。
+# 现要求失败数据全部留档，每次测试各存一份报告，因此需要重建表去掉该约束。
+_REPORTS_REBUILD_SCRIPT = """
+BEGIN IMMEDIATE;
+CREATE TABLE reports_rebuilt (
+    id TEXT PRIMARY KEY,
+    report_no TEXT NOT NULL UNIQUE,
+    sn TEXT NOT NULL,
+    run_id TEXT NOT NULL UNIQUE,
+    product_model TEXT NOT NULL,
+    station TEXT NOT NULL,
+    operator TEXT NOT NULL,
+    script_name TEXT NOT NULL,
+    script_version INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('PASS', 'FAIL')),
+    summary_json TEXT NOT NULL,
+    report_json TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT NOT NULL,
+    duration_ms INTEGER NOT NULL,
+    mes_status TEXT NOT NULL DEFAULT 'PENDING' CHECK(mes_status IN ('PENDING', 'UPLOADING', 'SUCCESS', 'FAILED')),
+    mes_attempts INTEGER NOT NULL DEFAULT 0,
+    mes_response TEXT,
+    uploaded_at TEXT,
+    FOREIGN KEY(sn) REFERENCES products(sn),
+    FOREIGN KEY(run_id) REFERENCES test_runs(id)
+);
+INSERT INTO reports_rebuilt
+    SELECT id, report_no, sn, run_id, product_model, station, operator, script_name, script_version,
+           status, summary_json, report_json, started_at, finished_at, duration_ms,
+           mes_status, mes_attempts, mes_response, uploaded_at
+    FROM reports;
+DROP TABLE reports;
+ALTER TABLE reports_rebuilt RENAME TO reports;
+CREATE INDEX IF NOT EXISTS idx_reports_finished ON reports(finished_at DESC);
+CREATE INDEX IF NOT EXISTS idx_reports_mes ON reports(mes_status);
+CREATE INDEX IF NOT EXISTS idx_reports_sn ON reports(sn);
+COMMIT;
+"""
+
+
+def _reports_sn_is_unique(connection: sqlite3.Connection) -> bool:
+    """检测 reports.sn 是否仍带旧版唯一索引（逐列比对，兼容 sqlite_autoindex 命名）。"""
+    for index in connection.execute("PRAGMA index_list(reports)").fetchall():
+        if not index["unique"]:
+            continue
+        columns = [
+            row["name"]
+            for row in connection.execute(f"PRAGMA index_info({index['name']})").fetchall()
+        ]
+        if columns == ["sn"]:
+            return True
+    return False
+
+
 class Database:
     def __init__(self, path: str | Path | None = None):
         if path is None:
@@ -287,6 +344,14 @@ class Database:
         with self.session() as connection:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript(SCHEMA)
+            if _reports_sn_is_unique(connection):
+                # 重建 reports 表前关闭外键检查，避免 DROP 父表时级联清空 mes_upload_logs；
+                # PRAGMA foreign_keys 仅在事务外生效，重建脚本自身用 BEGIN/COMMIT 保证原子性。
+                connection.execute("PRAGMA foreign_keys = OFF")
+                try:
+                    connection.executescript(_REPORTS_REBUILD_SCRIPT)
+                finally:
+                    connection.execute("PRAGMA foreign_keys = ON")
             item_columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(test_items)").fetchall()
             }

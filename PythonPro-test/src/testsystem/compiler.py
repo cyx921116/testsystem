@@ -42,6 +42,24 @@ class ScriptValidationError(ValueError):
         self.errors = errors
 
 
+def _normalize_max_retests(script: dict[str, Any], errors: list[str]) -> None:
+    """校验并规范化流程级失败复测次数（max_retests 字段）。
+
+    规则：字段可缺省（缺省时执行端回退到工位策略里的全局 max_retests）；
+    填写时必须是 0-20 的整数，0 表示该流程失败后不允许复测。
+    v1（步骤式）与 v2（控制流）编译器共用本函数，保证两种流程语义一致。
+    """
+    value = script.get("max_retests")
+    if value is None or value == "":
+        # 未配置：移除空值字段，执行时回退到工位策略
+        script.pop("max_retests", None)
+        return
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 20:
+        errors.append("max_retests 必须是 0-20 的整数（留空表示跟随工位策略）")
+        return
+    script["max_retests"] = value
+
+
 DEFAULT_SCRIPT: dict[str, Any] = {
     "schema_version": 1,
     "name": "通用电子产品出厂测试",
@@ -201,6 +219,7 @@ def compile_script(source: dict[str, Any]) -> dict[str, Any]:
     station_code = str(script.get("station_code", "")).strip()
     if station_code and not STATION_CODE_PATTERN.fullmatch(station_code):
         errors.append("station_code 仅允许字母、数字、点、下划线、连字符，且以字母或数字开头")
+    _normalize_max_retests(script, errors)
     if not isinstance(script.get("variables", {}), dict):
         errors.append("variables 必须是 JSON 对象")
     steps = script.get("steps")

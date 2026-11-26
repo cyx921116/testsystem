@@ -203,6 +203,19 @@ def _validate_sn(sn: str) -> str:
     return sn
 
 
+def _effective_max_retests(script: sqlite3.Row) -> int:
+    """计算当前流程生效的失败复测次数上限。
+
+    优先取流程定义中的 max_retests（流程级策略，可按产品差异化配置）；
+    流程未配置时回退到工位策略中的全局 max_retests 设置。
+    """
+    definition = json.loads(script["definition_json"])
+    value = definition.get("max_retests")
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return int(database.setting("max_retests", DEFAULT_SETTINGS["max_retests"]))
+
+
 def _run(run_id: str) -> dict[str, Any]:
     row = database.one("SELECT * FROM test_runs WHERE id = ?", (run_id,))
     if row is None:
@@ -699,6 +712,14 @@ def delete_master_station(code: str) -> dict[str, str]:
 
 @app.post("/api/test-runs/scan")
 def scan_sn(payload: SNPayload) -> dict[str, Any]:
+    """扫码预检：判定该 SN 是否允许（复）测。
+
+    判定规则（对所有测试流程统一生效）：
+    1. 已存在 PASS 报告 → 禁止重复测试；
+    2. 已完成次数（按 SN 跨全部流程累计 test_runs 中的 PASS/FAIL）达到
+       1 + 生效复测上限 → 禁止再测；失败数据全部保留，不会因复测被清除；
+    3. 本工位有正在执行的测试 → 提示等待。
+    """
     sn = _validate_sn(payload.sn)
     script = _get_script(payload.script_id)
     now = utc_now()
@@ -708,34 +729,42 @@ def scan_sn(payload: SNPayload) -> dict[str, Any]:
             "ON CONFLICT(sn) DO UPDATE SET product_model = excluded.product_model",
             (sn, script["product_model"], now),
         )
-    report = database.one("SELECT id, report_no, status FROM reports WHERE sn = ?", (sn,))
+    passed = database.one(
+        "SELECT id, report_no FROM reports WHERE sn = ? AND status = 'PASS' LIMIT 1", (sn,)
+    )
+    # 最新一份报告仅用于前端展示“查看已有报告”，不再作为能否复测的依据
+    latest_report = database.one(
+        "SELECT id, report_no, status FROM reports WHERE sn = ? "
+        "ORDER BY finished_at DESC, rowid DESC LIMIT 1",
+        (sn,),
+    )
     active = database.one(
         "SELECT id, sn FROM test_runs WHERE status = 'RUNNING' AND station = ?",
         (database.setting("station_id"),),
     )
-    max_retests = int(database.setting("max_retests", DEFAULT_SETTINGS["max_retests"]))
+    max_retests = _effective_max_retests(script)
     max_attempts = 1 + max_retests
+    # 复测计数按 SN 跨全部测试流程累计：换流程、换脚本版本都不能绕过失败次数限制
     attempts = database.one(
         "SELECT COUNT(*) AS count FROM test_runs WHERE sn = ? AND status IN ('PASS', 'FAIL')", (sn,)
     )["count"]
-    retestable = report is not None and report["status"] == "FAIL" and attempts < max_attempts
     result = {
         "sn": sn,
         "product_model": script["product_model"],
-        "can_start": (report is None or retestable) and active is None,
-        "report": {"id": report["id"], "report_no": report["report_no"], "status": report["status"]} if report else None,
+        "can_start": passed is None and attempts < max_attempts and active is None,
+        "report": dict(latest_report) if latest_report else None,
         "active_run_id": active["id"] if active else None,
         "attempt": attempts + 1,
         "max_attempts": max_attempts,
         "message": "SN 校验通过，可以开始测试",
     }
-    if report and report["status"] == "PASS":
+    if passed is not None:
         result["message"] = "该 SN 已测试合格，禁止重复测试"
-    elif report and not retestable:
+    elif attempts >= max_attempts:
         result["message"] = f"该 SN 复测次数已用完（已测 {attempts}/{max_attempts} 次），禁止重复测试"
     elif active:
         result["message"] = f"工位正在测试 {active['sn']}，请等待完成"
-    elif retestable:
+    elif attempts > 0:
         result["message"] = f"该 SN 上次测试失败，允许复测（第 {attempts + 1}/{max_attempts} 次）"
     return result
 
@@ -754,16 +783,18 @@ def start_test(payload: StartPayload, request: Request) -> dict[str, Any]:
     definition = json.loads(script["definition_json"])
     try:
         with database.transaction() as connection:
-            report_row = connection.execute("SELECT status FROM reports WHERE sn = ?", (sn,)).fetchone()
-            if report_row is not None:
-                if report_row["status"] == "PASS":
-                    raise HTTPException(409, "该 SN 已测试合格，禁止重复测试")
-                max_attempts = 1 + int(database.setting("max_retests", DEFAULT_SETTINGS["max_retests"]))
-                attempts = connection.execute(
-                    "SELECT COUNT(*) AS count FROM test_runs WHERE sn = ? AND status IN ('PASS', 'FAIL')", (sn,)
-                ).fetchone()["count"]
-                if attempts >= max_attempts:
-                    raise HTTPException(409, f"该 SN 复测次数已用完（已测 {attempts}/{max_attempts} 次），禁止重复测试")
+            # 与扫码预检相同的规则在事务内复检，防止并发请求绕过限制：
+            # 1) 已有 PASS 报告禁止再测；2) 跨全部流程累计的失败/完成次数达到上限禁止再测。
+            if connection.execute(
+                "SELECT 1 FROM reports WHERE sn = ? AND status = 'PASS' LIMIT 1", (sn,)
+            ).fetchone():
+                raise HTTPException(409, "该 SN 已测试合格，禁止重复测试")
+            max_attempts = 1 + _effective_max_retests(script)
+            attempts = connection.execute(
+                "SELECT COUNT(*) AS count FROM test_runs WHERE sn = ? AND status IN ('PASS', 'FAIL')", (sn,)
+            ).fetchone()["count"]
+            if attempts >= max_attempts:
+                raise HTTPException(409, f"该 SN 复测次数已用完（已测 {attempts}/{max_attempts} 次），禁止重复测试")
             if connection.execute(
                 "SELECT 1 FROM test_runs WHERE station = ? AND status = 'RUNNING'", (station,)
             ).fetchone():

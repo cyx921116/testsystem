@@ -8,6 +8,7 @@ from .compiler import (
     STATION_CODE_PATTERN,
     SUPPORTED_PROTOCOLS,
     ScriptValidationError,
+    _normalize_max_retests,
     _number,
     _validate_action,
 )
@@ -224,6 +225,7 @@ def compile_control_script(source: dict[str, Any]) -> dict[str, Any]:
     station_code = str(script.get("station_code", "")).strip()
     if station_code and not STATION_CODE_PATTERN.fullmatch(station_code):
         errors.append("station_code 仅允许字母、数字、点、下划线、连字符，且以字母或数字开头")
+    _normalize_max_retests(script, errors)
     if not isinstance(script.get("variables", {}), dict):
         errors.append("variables 必须是对象")
     steps = script.get("steps")
