@@ -31,7 +31,7 @@ import {
   reorderSequence,
   updateNode,
 } from "./model";
-import type { Action, Assertion, FlowDefinition, FlowNode, NodeType, Path } from "./types";
+import type { Action, Assertion, FirmwareInfo, FlowDefinition, FlowNode, NodeType, Path } from "./types";
 import { actionLabels, nodeLabels, operatorLabels } from "./types";
 
 interface PilotNodeData extends Record<string, unknown> {
@@ -162,7 +162,9 @@ interface EditorProps {
 }
 
 let externalSetDefinition: ((definition: FlowDefinition) => void) | null = null;
+let externalSetFirmware: ((firmware: FirmwareInfo[]) => void) | null = null;
 let latestDefinition: FlowDefinition | null = null;
+let latestFirmware: FirmwareInfo[] = [];
 let editorRoot: Root | null = null;
 
 function FlowEditorApp({ initialDefinition, onChange }: EditorProps) {
@@ -172,6 +174,7 @@ function FlowEditorApp({ initialDefinition, onChange }: EditorProps) {
   const [currentFlow, setCurrentFlow] = useState("main");
   const [subflowError, setSubflowError] = useState("");
   const [selectedPath, setSelectedPath] = useState<Path | null>(null);
+  const [firmware, setFirmwareList] = useState<FirmwareInfo[]>(latestFirmware);
   const layout = useMemo(() => buildGraph(definition, currentFlow), [definition, currentFlow]);
   const [nodes, setNodes] = useState<PilotRfNode[]>(layout.nodes);
   const canvasRef = useRef<HTMLDivElement | null>(null);
@@ -233,6 +236,13 @@ function FlowEditorApp({ initialDefinition, onChange }: EditorProps) {
       });
     };
     return () => { externalSetDefinition = null; };
+  }, []);
+  useEffect(() => {
+    externalSetFirmware = (next) => {
+      latestFirmware = next;
+      setFirmwareList(next);
+    };
+    return () => { externalSetFirmware = null; };
   }, []);
 
   const updateDefinition = useCallback((next: FlowDefinition) => {
@@ -408,6 +418,7 @@ function FlowEditorApp({ initialDefinition, onChange }: EditorProps) {
             node={selectedNode}
             path={selectedPath}
             currentFlow={currentFlow}
+            firmware={firmware}
             onUpdate={(updater) => updateDefinition(updateNode(definitionRef.current, selectedPath, updater))}
             onDelete={() => { updateDefinition(removeNode(definitionRef.current, selectedPath)); setSelectedPath(null); }}
             onDuplicate={duplicateSelected}
@@ -519,7 +530,7 @@ const jlinkOperations: Record<string, string> = {
   go: "运行",
 };
 
-function ActionFields({ action, protocol, onChange }: { action: Action; protocol?: string; onChange: (action: Action) => void }) {
+function ActionFields({ action, protocol, firmware, onChange }: { action: Action; protocol?: string; firmware: FirmwareInfo[]; onChange: (action: Action) => void }) {
   const update = (patch: Partial<Action>) => onChange({ ...action, ...patch });
   const params = (action.params || {}) as Record<string, unknown>;
   const updateParam = (key: string, value: unknown) => update({ params: { ...params, [key]: value } });
@@ -555,19 +566,24 @@ function ActionFields({ action, protocol, onChange }: { action: Action; protocol
     </>}
     {action.type === "assert" && <AssertionFields value={action as unknown as Assertion} onChange={(assertion) => onChange({ ...assertion, type: "assert" })} />}
     {action.type === "sleep" && <Field label="延时 ms"><input type="number" min={0} value={Number(action.duration_ms || 0)} onChange={(event) => update({ duration_ms: Number(event.target.value) })} /></Field>}
-    {action.type === "flash" && <FlashFields action={action} onChange={onChange} />}
+    {action.type === "flash" && <FlashFields action={action} firmware={firmware} onChange={onChange} />}
   </>;
 }
 
-function FlashFields({ action, onChange }: { action: Action; onChange: (action: Action) => void }) {
+function FlashFields({ action, firmware, onChange }: { action: Action; firmware: FirmwareInfo[]; onChange: (action: Action) => void }) {
   const options = (action.options || {}) as Record<string, unknown>;
   const update = (patch: Partial<Action>) => onChange({ ...action, ...patch });
   const updateOption = (key: string, value: unknown) => update({ options: { ...options, [key]: value } });
   return <>
-    <Field label="固件名称或 ID" hint="必须已在“固件烧录”页面登记入仓；也可填 ${变量} 在运行时解析。"><input value={String(action.firmware ?? "")} onChange={(event) => update({ firmware: event.target.value })} /></Field>
+    <Field label="固件" hint="候选来自“固件烧录”页面登记的固件仓；也可填 ${变量} 在运行时解析。">
+      <input list="pilot-firmware-options" placeholder={firmware.length ? "选择或输入固件名称" : "固件仓为空，请先在“固件烧录”页面登记"} value={String(action.firmware ?? "")} onChange={(event) => update({ firmware: event.target.value })} />
+      <datalist id="pilot-firmware-options">
+        {firmware.map((item) => <option key={item.name} value={item.name}>{`v${item.version || "?"} · ${item.product_model || "通用"}`}</option>)}
+      </datalist>
+    </Field>
     <div className="pilot-field-grid">
       <Field label="目标槽位（可选）"><input value={String(action.target ?? "")} onChange={(event) => update({ target: event.target.value })} /></Field>
-      <Field label="结果保存为" hint="保存烧录结果，可断言 ${变量.firmware.version}"><input value={String(action.save_as ?? "")} onChange={(event) => update({ save_as: event.target.value })} /></Field>
+      <Field label="结果保存为" hint="保存烧录结果，可断言 ${变量.ok} 判定烧录是否成功"><input value={String(action.save_as ?? "")} onChange={(event) => update({ save_as: event.target.value })} /></Field>
     </div>
     <div className="pilot-field-grid">
       <Field label="烧录超时 ms"><input type="number" min={1} value={Number(options.timeout_ms ?? 60000)} onChange={(event) => updateOption("timeout_ms", Number(event.target.value))} /></Field>
@@ -595,6 +611,7 @@ interface InspectorProps {
   node: FlowNode;
   path: Path;
   currentFlow: string;
+  firmware: FirmwareInfo[];
   onUpdate: (updater: (node: FlowNode) => FlowNode) => void;
   onDelete: () => void;
   onDuplicate: () => void;
@@ -603,7 +620,7 @@ interface InspectorProps {
   onUpdateDefinition: (definition: FlowDefinition) => void;
 }
 
-function Inspector({ definition, node, path, currentFlow, onUpdate, onDelete, onDuplicate, onAddNested, onEditSubflow, onUpdateDefinition }: InspectorProps) {
+function Inspector({ definition, node, path, currentFlow, firmware, onUpdate, onDelete, onDuplicate, onAddNested, onEditSubflow, onUpdateDefinition }: InspectorProps) {
   const update = (patch: Partial<FlowNode>) => onUpdate((current) => ({ ...current, ...patch }));
   return <div className="pilot-inspector-content">
     <div className="pilot-inspector-title"><span>{nodeLabels[node.type]}</span><strong>{node.name}</strong><small>{path.join(" / ")}</small></div>
@@ -616,7 +633,7 @@ function Inspector({ definition, node, path, currentFlow, onUpdate, onDelete, on
       <div className="pilot-field-grid"><Field label="超时 ms"><input type="number" value={node.timeout_ms} onChange={(event) => update({ timeout_ms: Number(event.target.value) })} /></Field><Field label="重试"><input type="number" value={node.retries} onChange={(event) => update({ retries: Number(event.target.value) })} /></Field></div>
       <div className="pilot-inspector-section"><div className="pilot-section-title"><strong>执行动作</strong><span>从上到下依次执行</span></div>{(node.actions || []).map((action, index) => <div className="pilot-action-editor" key={index}>
         <div className="pilot-action-toolbar"><span><i>{index + 1}</i>{actionLabels[action.type]}</span><div><button title="上移动作" disabled={index === 0} onClick={() => onUpdate((current) => { const next = clone(current); [next.actions![index - 1], next.actions![index]] = [next.actions![index], next.actions![index - 1]]; return next; })}>↑</button><button title="下移动作" disabled={index === node.actions!.length - 1} onClick={() => onUpdate((current) => { const next = clone(current); [next.actions![index + 1], next.actions![index]] = [next.actions![index], next.actions![index + 1]]; return next; })}>↓</button><button title="删除动作" onClick={() => onUpdate((current) => { const next = clone(current); next.actions!.splice(index, 1); return next; })}>×</button></div></div>
-        <ActionFields action={action} protocol={node.protocol} onChange={(updated) => onUpdate((current) => { const next = clone(current); next.actions![index] = updated; return next; })} />
+        <ActionFields action={action} protocol={node.protocol} firmware={firmware} onChange={(updated) => onUpdate((current) => { const next = clone(current); next.actions![index] = updated; return next; })} />
       </div>)}<ActionAdder onAdd={(type) => update({ actions: [...(node.actions || []), createAction(type)] })} /><p className="pilot-inspector-note">先采集数据，再添加断言。动作结果用变量连接，无需手工编写编码或执行代码。</p></div>
     </>}
 
@@ -672,4 +689,9 @@ function setDefinition(definition: FlowDefinition) {
   externalSetDefinition?.(definition);
 }
 
-export { FlowEditorApp, Inspector, mount, setDefinition };
+function setFirmware(firmware: FirmwareInfo[]) {
+  latestFirmware = firmware;
+  externalSetFirmware?.(firmware);
+}
+
+export { FlowEditorApp, Inspector, mount, setDefinition, setFirmware };

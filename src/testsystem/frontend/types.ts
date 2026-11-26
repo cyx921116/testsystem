@@ -56,6 +56,13 @@ export interface FlowDefinition {
   subflows: Record<string, SubflowDefinition>;
 }
 
+export interface FirmwareInfo {
+  name: string;
+  version?: string;
+  product_model?: string;
+  description?: string;
+}
+
 export const nodeLabels: Record<NodeType, string> = {
   test: "测试项",
   condition: "条件判断",

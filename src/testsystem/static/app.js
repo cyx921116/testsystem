@@ -149,7 +149,7 @@ function navigate(page) {
   $("#page-subtitle").textContent = pageMeta[page][1];
   history.replaceState(null, "", `#${page}`);
   if (page === "production") loadDashboard();
-  if (page === "scripts") renderScriptLibrary();
+  if (page === "scripts") { renderScriptLibrary(); loadFirmware(); }
   if (page === "protocols") loadProtocols();
   if (page === "firmware") loadFirmware();
   if (page === "mes") loadMesSettings();
@@ -401,8 +401,8 @@ function optionTags(options, selected) {
   return Object.entries(options).map(([value, label]) => `<option value="${escapeHtml(value)}" ${value === selected ? "selected" : ""}>${escapeHtml(label)}</option>`).join("");
 }
 
-function textActionField(si, ai, key, label, value, wide = false, type = "text") {
-  return `<div class="action-field ${wide ? "wide" : ""}"><label>${escapeHtml(label)}</label><input type="${type}" data-action-field data-s="${si}" data-a="${ai}" data-key="${key}" value="${escapeHtml(value ?? "")}"></div>`;
+function textActionField(si, ai, key, label, value, wide = false, type = "text", list = "") {
+  return `<div class="action-field ${wide ? "wide" : ""}"><label>${escapeHtml(label)}</label><input type="${type}"${list ? ` list="${list}"` : ""} data-action-field data-s="${si}" data-a="${ai}" data-key="${key}" value="${escapeHtml(value ?? "")}"></div>`;
 }
 
 function renderAction(action, si, ai) {
@@ -433,9 +433,9 @@ function renderAction(action, si, ai) {
     fields += textActionField(si, ai, "duration_ms", "延时时长 ms", action.duration_ms, false, "number");
   } else if (action.type === "flash") {
     const options = action.options || {};
-    fields += textActionField(si, ai, "firmware", "固件名称或 ID / 支持 ${变量}", action.firmware, true);
+    fields += textActionField(si, ai, "firmware", "固件名称（候选来自固件仓）/ 支持 ${变量}", action.firmware, true, "text", "firmware-options");
     fields += textActionField(si, ai, "target", "目标槽位（可选）", action.target);
-    fields += textActionField(si, ai, "save_as", "结果保存为", action.save_as);
+    fields += textActionField(si, ai, "save_as", "结果保存为（可断言 ${变量.ok}）", action.save_as);
     fields += textActionField(si, ai, "timeout_ms", "烧录超时 ms", options.timeout_ms ?? 60000, false, "number");
     for (const [key, label] of [["erase", "烧录前擦除"], ["verify", "烧录后校验"], ["reset", "烧录后复位"]]) {
       fields += `<div class="action-field"><label>${label}</label><select data-action-field data-s="${si}" data-a="${ai}" data-key="${key}">${optionTags({ true: "是", false: "否" }, String(options[key] ?? true))}</select></div>`;
@@ -996,7 +996,17 @@ async function loadFirmware() {
     state.flashers = flashers;
     state.flasherConfig = config;
     renderFirmware();
+    renderFirmwareOptions();
   } catch (error) { toast(error.message, "error"); }
+}
+
+function renderFirmwareOptions() {
+  const datalist = $("#firmware-options");
+  if (datalist) {
+    datalist.innerHTML = state.firmware.map((item) =>
+      `<option value="${escapeHtml(item.name)}">v${escapeHtml(item.version || "?")} · ${escapeHtml(item.product_model || "通用")}</option>`).join("");
+  }
+  window.PilotFlowEditor?.setFirmware(state.firmware);
 }
 
 function renderFirmware() {

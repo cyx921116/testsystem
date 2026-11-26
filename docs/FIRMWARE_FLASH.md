@@ -81,7 +81,7 @@ flasher.py
  "options": {"erase": true, "verify": true, "reset": true, "timeout_ms": 60000}}
 ```
 
-`firmware` 支持 `${变量}` 在运行时解析；`save_as` 保存烧录结果，后续动作可用 `${flash_result.firmware.version}` 等路径断言；`target`、`variables` 会透传给烧录后端（如外部工具命令模板）。
+`firmware` 支持 `${变量}` 在运行时解析，前端编辑器会列出固件仓中已登记的固件供选择；`save_as` 保存烧录结果，后续动作可用 `${flash_result.ok}` 判定烧录是否成功、用 `${flash_result.firmware.version}` 等路径断言版本；`target`、`variables` 会透传给烧录后端（如外部工具命令模板）。
 
 ## 5. 烧录后端
 

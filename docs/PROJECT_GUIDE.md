@@ -1242,7 +1242,7 @@ UTC 时间转本地时间；毫秒根据大小显示为 ms 或秒。
 - set：变量名和值。
 - assert：实际值、操作符、期望值、失败提示。
 - sleep：毫秒。
-- flash：固件名称、目标槽位、结果变量、烧录超时与擦除/校验/复位开关。
+- flash：固件名称（下拉候选来自固件仓，可手输 `${变量}`）、目标槽位、结果变量、烧录超时与擦除/校验/复位开关。
 
 `si`、`ai` 分别是步骤和动作下标，用于事件更新正确定位。
 
@@ -1362,7 +1362,7 @@ PUT 保存当前协议，更新本地配置和 JSON 编辑器。
 - `types.ts`：递归节点定义和界面标签。
 - `flow-editor.css`：React Flow 和检查器样式。
 
-`PilotFlowEditor.mount()` 把编辑器挂载到现有页面；`setDefinition()` 同步原页面草稿。React 的 `onChange` 只更新 `state.draft`，保存和编译仍由原页面负责。
+`PilotFlowEditor.mount()` 把编辑器挂载到现有页面；`setDefinition()` 同步原页面草稿；`setFirmware()` 同步固件仓清单，烧录动作的固件字段据此给出下拉候选。React 的 `onChange` 只更新 `state.draft`，保存和编译仍由原页面负责。
 
 旧 `flow-model.js` 继续服务于传统顺序列表。旧的 `renderVisualEditor()` 和 `bindVisualEditor()` 保留为兼容代码，但默认画布由 React 接管。
 
