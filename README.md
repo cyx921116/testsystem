@@ -6,6 +6,7 @@
 
 - [详细项目开发说明](docs/PROJECT_GUIDE.md)：架构、目录、数据库、后端函数、前端函数、脚本、协议、MES、API 和扩展方法。
 - [控制流与 React Flow 开发说明](docs/CONTROL_FLOW.md)：条件、并行、循环、子流程、v2 JSON、执行语义和前端构建。
+- [固件烧录框架开发说明](docs/FIRMWARE_FLASH.md)：固件仓、烧录后端、烧录记录和接入主系统的路线。
 - [Git 与 GitHub 配置指南](docs/GIT_GITHUB.md)：Windows 环境、提交身份、登录授权、创建仓库、推送和常见问题。
 
 ## 启动

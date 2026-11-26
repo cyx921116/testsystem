@@ -85,6 +85,7 @@ Testsystem/
 ├── docs/
 │   ├── PROJECT_GUIDE.md       本详细开发说明
 │   ├── CONTROL_FLOW.md        v2 控制流、执行语义和 React 构建
+│   ├── FIRMWARE_FLASH.md      固件烧录框架、固件仓与后端接入路线
 │   └── GIT_GITHUB.md          Git、GitHub 登录与上传指南
 └── src/
     ├── main.py                兼容直接运行该脚本时调用系统入口
@@ -98,6 +99,7 @@ Testsystem/
         ├── database.py        SQLite 表结构、迁移、默认配置、连接和事务
         ├── executor.py        运行生命周期、v1 执行、报告定稿
         ├── control_flow.py    v2 递归执行、并行、循环和控制事件
+        ├── flasher.py         固件烧录框架：固件仓、烧录后端与记录
         ├── mes.py             MES 报文构造、HTTP 上传、上传日志
         ├── protocols.py       各通讯协议适配器
         ├── protocol_definitions.py 协议字段元数据和默认连接参数
@@ -983,6 +985,19 @@ Pydantic 在业务函数之前拒绝缺失或类型明显错误的请求。
 
 `upload_report()` 把 MES 异常转换为 HTTP 502，表示上游 MES 不可用或拒绝，不是本地报告丢失。
 
+## 7.10 `flasher.py`：固件烧录框架
+
+当前为框架阶段，未接入执行器，不影响现有测试流程。详细说明和接入路线见 [固件烧录框架开发说明](FIRMWARE_FLASH.md)。
+
+- `firmware_dir()` / `register_firmware()` / `find_firmware()`：固件仓管理。固件复制入 `data/firmware/`，清单 `firmware.json` 记录版本、型号和 SHA-256；查找时重新校验文件校验和，防止烧入被替换的固件。
+- `validate_flash_request()`：规范化烧录请求，固件必须已登记，选项（擦除/校验/复位/超时）与默认值合并。
+- `BaseFlasher`：烧录后端统一接口，`probe()` 检查驱动，`flash(request, on_progress)` 执行并返回统一结果 dict，`on_progress` 回调上报百分比进度。
+- `SimulatorFlasher`：仿真烧录，分阶段模拟全过程，`fail_at_stage` 可注入失败，无硬件可验证烧录流程。
+- `JLinkFlasher`：J-Link 烧录骨架，连接、擦除、`flash_file()` 下载、复位的流程已搭好；安全解锁和量产校验是明确标注的 TODO，需按芯片封装后才能在产线使用。
+- `ExternalToolFlasher`：通过命令模板调用外部 CLI 烧录工具（如 STM32_Programmer_CLI），支持超时、返回码和输出关键字判定。
+- `build_flash_record()`：生成“哪个 SN 烧了什么固件”的可追溯记录，供后续 `flash_records` 表持久化。
+- `create_flasher()` / `flasher_catalog()`：后端工厂与目录，风格同 `create_protocol()` / `protocol_catalog()`。
+
 ## 8. 前端详细说明
 
 ## 8.1 `static/index.html`：页面结构
@@ -1642,6 +1657,16 @@ SN 绑定步骤建议同时校验产品返回 SN 与扫码 SN，避免扫了 A �
 - 引入用户、角色、电子签名、审计日志和脚本审批。
 - 不要把多个 Uvicorn worker 当成多工位调度器。
 
+### 12.7 接入固件烧录
+
+固件烧录框架已在 `flasher.py` 就绪（固件仓、烧录后端、烧录记录），接入主系统时：
+
+1. 在 `compiler.py` / `control_compiler.py` 增加 `flash` 动作类型，校验固件已登记和选项合法。
+2. 在 `executor.py` 的 `_execute_actions()` 增加 `flash` 分支，复用协议缓存思路管理烧录器连接，失败按步骤失败处理。
+3. 新增 `flash_records` 表保存 `build_flash_record()` 结果，随运行和报告追溯。
+4. 前端增加烧录动作字段、进度展示和固件管理页面。
+5. J-Link 后端量产前必须完成芯片安全解锁和量产校验封装，见 [固件烧录框架开发说明](FIRMWARE_FLASH.md)。
+
 ## 13. 部署与安全建议
 
 1. 使用 Windows 服务或受控进程管理器启动，避免用户误关终端。
@@ -1677,8 +1702,9 @@ SN 绑定步骤建议同时校验产品返回 SN 与扫码 SN，避免扫了 A �
 - 本地 MES 首次返回 500，报告标记 FAILED；重试返回 201 后标记 SUCCESS。
 - MES 字段映射、幂等请求头、成功后不重复发送和两条上传日志。
 - Windows 下后台结束和 SQLite 临时文件清理。
+- 固件烧录框架：固件登记/查找/校验和校验、仿真烧录进度与失败注入、外部工具烧录成功/失败/超时、后端工厂与目录的自动化测试。
 
-尚未在真实串口、CAN、Modbus、BLE、MQTT、J-Link 硬件上联调。协议适配代码已提供，但现场仍需验证具体设备驱动、电气连接、产品协议和超时。
+尚未在真实串口、CAN、Modbus、BLE、MQTT、J-Link 硬件上联调。协议适配代码已提供，但现场仍需验证具体设备驱动、电气连接、产品协议和超时。固件烧录框架同样未在真实烧录器上联调，J-Link 后端的安全解锁和量产校验仍是 TODO，详见 [固件烧录框架开发说明](FIRMWARE_FLASH.md)。
 
 自动化测试位于 `tests/`，覆盖控制流编译、十进制编解码、协议旧配置迁移、未登录拦截、管理员/操作工权限、用户管理、密码会话失效和操作工完整仿真测试。运行 `uv run pytest`；前端运行 `npm run typecheck` 和 `npm run build`。真实硬件和现场 MES 仍需按设备协议单独联调。
 
