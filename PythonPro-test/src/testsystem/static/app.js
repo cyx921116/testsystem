@@ -9,6 +9,8 @@ const state = {
   applicationMounted: false,
   scripts: [],
   selectedScriptId: null,
+  selectedProduct: null,
+  selectedStation: "",
   draft: null,
   draftId: null,
   draftVersion: null,
@@ -149,8 +151,9 @@ function navigate(page) {
   $("#page-title").textContent = pageMeta[page][0];
   $("#page-subtitle").textContent = pageMeta[page][1];
   history.replaceState(null, "", `#${page}`);
-  if (page === "production") loadDashboard();
-  if (page === "scripts") { renderScriptLibrary(); loadFirmware(); }
+  // 切回生产页时刷新流程列表，保证编排页新建/停用的流程即时反映到执行台索引
+  if (page === "production") { loadDashboard(); loadScripts().then(renderPreview); }
+  if (page === "scripts") { renderScriptLibrary(); loadFirmware(); loadMasterData(); }
   if (page === "protocols") loadProtocols();
   if (page === "firmware") loadFirmware();
   if (page === "mes") { loadMesSettings(); loadMasterData(); }
@@ -179,17 +182,90 @@ async function loadDashboard() {
   } catch (error) { toast(error.message, "error"); }
 }
 
+// 执行台索引的候选流程：包含所有启用的流程。
+// 不再按终端工站预先过滤（否则会“索引不到”绑定其他工站的新建流程）；
+// 工站维度交给“测试工站”下拉区分，终端配置工站仅用于默认选中项。
+function productionCandidates() {
+  return state.scripts.filter((script) => script.enabled);
+}
+
+function matchingScripts() {
+  return productionCandidates().filter((script) =>
+    script.product_model === state.selectedProduct && (script.station_code || "") === (state.selectedStation || ""));
+}
+
 async function loadScripts() {
   state.scripts = await api("/api/scripts");
-  const station = state.settings?.station_id || "";
-  const enabled = state.scripts.filter((script) => script.enabled && (!script.station_code || !station || script.station_code === station));
-  if (!enabled.some((script) => script.id === state.selectedScriptId)) state.selectedScriptId = enabled[0]?.id || null;
-  $("#production-script").innerHTML = enabled.map((script) => `
-    <option value="${script.id}" ${script.id === state.selectedScriptId ? "selected" : ""}>${escapeHtml(script.product_model)} · ${escapeHtml(script.name)} · v${script.version}${script.station_code ? ` · ${escapeHtml(script.station_code)}` : ""}</option>`).join("");
+  const candidates = productionCandidates();
+  let script = candidates.find((item) => item.id === state.selectedScriptId);
+  if (!script) {
+    const station = state.settings?.station_id || "";
+    script = (state.selectedProduct && matchingScripts()[0])
+      || candidates.find((item) => station && item.station_code === station)
+      || candidates[0]
+      || null;
+  }
+  state.selectedScriptId = script ? script.id : null;
+  state.selectedProduct = script ? script.product_model : null;
+  state.selectedStation = script ? (script.station_code || "") : "";
+  renderProductionPicker();
+}
+
+function resolveProductionScript() {
+  const matches = matchingScripts();
+  if (!matches.some((item) => item.id === state.selectedScriptId)) {
+    state.selectedScriptId = matches[0]?.id || null;
+  }
+  renderProductionPicker();
+}
+
+function renderProductionPicker() {
+  const candidates = productionCandidates();
+  const products = [...new Set(candidates.map((script) => script.product_model))];
+  const productSelect = $("#production-product");
+  productSelect.innerHTML = products.length
+    ? products.map((model) => `<option value="${escapeHtml(model)}">${escapeHtml(model)}</option>`).join("")
+    : '<option value="">无可用产品</option>';
+  productSelect.value = state.selectedProduct || "";
+  const stations = state.selectedProduct
+    ? [...new Set(candidates.filter((script) => script.product_model === state.selectedProduct).map((script) => script.station_code || ""))]
+    : [];
+  const stationSelect = $("#production-station");
+  stationSelect.innerHTML = stations.length
+    ? stations.map((code) => `<option value="${escapeHtml(code)}">${escapeHtml(code || "不限工站")}</option>`).join("")
+    : '<option value="">—</option>';
+  stationSelect.value = state.selectedStation || "";
+  const matches = matchingScripts();
+  $("#production-flow-field").hidden = matches.length < 2;
+  $("#production-flow").innerHTML = matches.map((script) =>
+    `<option value="${script.id}" ${script.id === state.selectedScriptId ? "selected" : ""}>${escapeHtml(script.name)} · v${script.version}</option>`).join("");
+  const script = currentProductionScript();
+  $("#banner-model").textContent = state.selectedProduct || "—";
+  $("#banner-station").textContent = stations.length ? (state.selectedStation || "不限工站") : "—";
+  const terminalStation = state.settings?.station_id || "";
+  // 流程绑定工站与终端配置工站不一致时后端会拒绝执行（409），横幅提前醒目警示
+  const stationMismatch = Boolean(
+    script && script.station_code && terminalStation && script.station_code !== terminalStation
+  );
+  const banner = $("#script-banner");
+  banner.classList.toggle("no-match", !script || stationMismatch);
+  if (script) {
+    $("#banner-flow-name").textContent = script.name;
+    $("#banner-flow-meta").textContent = stationMismatch
+      ? `流程绑定工站 ${script.station_code}，与当前终端工站 ${terminalStation} 不一致，不能在本机执行`
+      : `流程 v${script.version} · ${previewTestNodes(script.definition).length} 个测试项`;
+  } else {
+    $("#banner-flow-name").textContent = products.length ? "该产品在当前工站下没有启用的测试流程" : "暂无可用流程，请在流程编排中创建并启用";
+    $("#banner-flow-meta").textContent = "";
+  }
+}
+
+function setProductionPickerDisabled(disabled) {
+  ["#production-product", "#production-station", "#production-flow"].forEach((selector) => { $(selector).disabled = disabled; });
 }
 
 function currentProductionScript() {
-  return state.scripts.find((script) => script.id === Number($("#production-script").value || state.selectedScriptId));
+  return state.scripts.find((script) => script.id === state.selectedScriptId) || null;
 }
 
 function renderTestItems(items) {
@@ -255,7 +331,7 @@ function resetConsole() {
   state.scan = null;
   $("#sn-input").value = "";
   $("#sn-input").disabled = false;
-  $("#production-script").disabled = false;
+  setProductionPickerDisabled(false);
   $("#scan-feedback").className = "scan-feedback";
   $("#scan-feedback").textContent = "SN 将与本次测试脚本快照和唯一报告绑定";
   $("#start-test").disabled = true;
@@ -299,7 +375,7 @@ async function startTest() {
       body: { sn: state.scan.sn, script_id: script.id, operator },
     });
     $("#sn-input").disabled = true;
-    $("#production-script").disabled = true;
+    setProductionPickerDisabled(true);
     renderRun();
     pollRun();
   } catch (error) {
@@ -369,10 +445,13 @@ async function resumeRun(runId) {
   clearTimeout(state.pollTimer);
   state.run = await api(`/api/test-runs/${runId}`);
   state.selectedScriptId = state.run.script_id;
-  $("#production-script").value = String(state.run.script_id);
+  const boundScript = state.scripts.find((item) => item.id === state.run.script_id);
+  state.selectedProduct = boundScript ? boundScript.product_model : state.run.product_model;
+  state.selectedStation = boundScript ? (boundScript.station_code || "") : "";
+  renderProductionPicker();
   $("#sn-input").value = state.run.sn;
   $("#sn-input").disabled = state.run.status === "RUNNING";
-  $("#production-script").disabled = state.run.status === "RUNNING";
+  setProductionPickerDisabled(state.run.status === "RUNNING");
   renderRun();
   if (state.run.status === "RUNNING") pollRun();
 }
@@ -627,6 +706,11 @@ function openScript(scriptId) {
   renderScriptLibrary();
 }
 
+function newScriptDraft() {
+  const firstProduct = state.master.products.find((item) => item.enabled);
+  return { schema_version: 1, name: "新产品测试流程", product_model: firstProduct ? firstProduct.code : "", station_code: "", variables: {}, steps: [newStep()] };
+}
+
 function renderScriptLibrary() {
   if (!state.draft && state.scripts.length) {
     const preferred = state.scripts.find((script) => script.id === state.selectedScriptId) || state.scripts[0];
@@ -639,21 +723,20 @@ function renderScriptLibrary() {
     <button class="script-list-item ${script.id === state.draftId ? "active" : ""} ${script.enabled ? "" : "disabled"}" data-script-select="${script.id}">
       <strong>${escapeHtml(script.name)}</strong><span>${escapeHtml(script.product_model)}${script.station_code ? ` · ${escapeHtml(script.station_code)}` : " · 不限工站"} · ${script.definition.steps.length} 个测试项</span><small>VERSION ${script.version}${script.enabled ? "" : " · 已停用"}</small>
     </button>`).join("") || '<div class="empty-row">暂无流程，请新建</div>';
-  if (!state.draft) state.draft = { schema_version: 1, name: "新产品测试流程", product_model: "NEW-MODEL", station_code: "", variables: {}, steps: [newStep()] };
+  if (!state.draft) state.draft = newScriptDraft();
   $("#draft-name").value = state.draft.name || "";
-  $("#draft-model").value = state.draft.product_model || "";
-  $("#draft-station").value = state.draft.station_code || "";
+  $("#draft-retests").value = state.draft.max_retests ?? "";
   $("#draft-version").textContent = state.draftVersion ? `v${state.draftVersion}` : "未保存";
   $("#validation-results").innerHTML = "";
   $("#script-json").value = JSON.stringify(state.draft, null, 2);
-  renderMasterDatalists();
+  renderMasterSelects();
   renderSteps();
 }
 
 function createNewScript() {
   state.draftId = null;
   state.draftVersion = null;
-  state.draft = { schema_version: 1, name: "新产品测试流程", product_model: "NEW-MODEL", station_code: "", variables: {}, steps: [newStep()] };
+  state.draft = newScriptDraft();
   state.selectedStep = 0;
   state.selectedAction = null;
   renderScriptLibrary();
@@ -860,7 +943,13 @@ function bindScriptEditor() {
     const button = event.target.closest("[data-script-select]");
     if (button) openScript(button.dataset.scriptSelect);
   });
-  [$("#draft-name"), $("#draft-model"), $("#draft-station")].forEach((input) => input.addEventListener("input", () => {
+  [$("#draft-name"), $("#draft-model"), $("#draft-station"), $("#draft-retests")].forEach((input) => input.addEventListener("input", () => {
+    // 复测次数是可选数字字段：留空表示跟随工位策略（从流程定义中移除该键），填写时存为整数
+    if (input.dataset.draftField === "max_retests") {
+      if (input.value === "") delete state.draft.max_retests;
+      else state.draft.max_retests = Number(input.value);
+      return;
+    }
     state.draft[input.dataset.draftField] = input.value;
   }));
   [$("#steps-container"), $("#node-inspector")].filter(Boolean).forEach((container) => {
@@ -881,8 +970,8 @@ function bindScriptEditor() {
       state.selectedStep = state.draft.steps.length ? 0 : -1;
       state.selectedAction = null;
       $("#draft-name").value = state.draft.name || "";
-      $("#draft-model").value = state.draft.product_model || "";
-      $("#draft-station").value = state.draft.station_code || "";
+      $("#draft-retests").value = state.draft.max_retests ?? "";
+      renderMasterSelects();
       renderSteps();
       toast("JSON 已应用，请执行编译校验", "success");
     } catch (error) { toast(error.message, "error"); }
@@ -1203,7 +1292,7 @@ async function loadMasterData() {
     state.master.stationsSync = stations.last_sync;
     state.master.mode = products.mode || "simulator";
     renderMasterTables();
-    renderMasterDatalists();
+    renderMasterSelects();
   } catch (error) { toast(error.message, "error"); }
 }
 
@@ -1237,11 +1326,28 @@ function renderMasterTables() {
   }
 }
 
-function renderMasterDatalists() {
-  $("#product-options").innerHTML = state.master.products.filter((item) => item.enabled)
-    .map((item) => `<option value="${escapeHtml(item.code)}">${escapeHtml(item.name)}</option>`).join("");
-  $("#station-options").innerHTML = state.master.stations.filter((item) => item.enabled)
-    .map((item) => `<option value="${escapeHtml(item.code)}">${escapeHtml(item.name)}</option>`).join("");
+function masterSelectOptions(items, currentValue, placeholder) {
+  const enabled = items.filter((item) => item.enabled);
+  const options = [`<option value="">${escapeHtml(placeholder)}</option>`];
+  options.push(...enabled.map((item) => `<option value="${escapeHtml(item.code)}">${escapeHtml(item.code)} · ${escapeHtml(item.name)}</option>`));
+  if (currentValue && !enabled.some((item) => item.code === currentValue)) {
+    const known = items.find((item) => item.code === currentValue);
+    options.push(`<option value="${escapeHtml(currentValue)}">${escapeHtml(currentValue)} · ${known ? "已停用" : "不在主数据"}</option>`);
+  }
+  return options.join("");
+}
+
+function renderMasterSelects() {
+  const draft = state.draft || {};
+  const productSelect = $("#draft-model");
+  const stationSelect = $("#draft-station");
+  const productPlaceholder = state.master.products.some((item) => item.enabled)
+    ? "请选择产品"
+    : "暂无产品，请先在 MES 页同步或添加";
+  productSelect.innerHTML = masterSelectOptions(state.master.products, draft.product_model || "", productPlaceholder);
+  stationSelect.innerHTML = masterSelectOptions(state.master.stations, draft.station_code || "", "不限工站");
+  productSelect.value = draft.product_model || "";
+  stationSelect.value = draft.station_code || "";
 }
 
 async function syncMaster(target) {
@@ -1541,8 +1647,26 @@ function bindEvents() {
   $("#scan-form").addEventListener("submit", (event) => { event.preventDefault(); scanSn(); });
   $("#start-test").addEventListener("click", startTest);
   $("#reset-test").addEventListener("click", resetConsole);
-  $("#production-script").addEventListener("change", () => {
-    state.selectedScriptId = Number($("#production-script").value);
+  $("#production-product").addEventListener("change", () => {
+    state.selectedProduct = $("#production-product").value || null;
+    const stations = [...new Set(productionCandidates()
+      .filter((script) => script.product_model === state.selectedProduct)
+      .map((script) => script.station_code || ""))];
+    const preferred = state.settings?.station_id && stations.includes(state.settings.station_id)
+      ? state.settings.station_id
+      : stations[0] || "";
+    state.selectedStation = stations.includes(state.selectedStation) ? state.selectedStation : preferred;
+    resolveProductionScript();
+    resetConsole();
+  });
+  $("#production-station").addEventListener("change", () => {
+    state.selectedStation = $("#production-station").value;
+    resolveProductionScript();
+    resetConsole();
+  });
+  $("#production-flow").addEventListener("change", () => {
+    state.selectedScriptId = Number($("#production-flow").value);
+    renderProductionPicker();
     resetConsole();
   });
   $("#report-filter").addEventListener("submit", (event) => { event.preventDefault(); loadReports(); });

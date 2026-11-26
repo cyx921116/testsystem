@@ -85,9 +85,18 @@ svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width:
 .card-header { display: flex; align-items: center; justify-content: space-between; gap: 15px; padding: 19px 21px; border-bottom: 1px solid #edf1f2; }
 .test-layout { display: grid; grid-template-columns: minmax(0, 1fr) 285px; gap: 20px; align-items: start; }
 .console-header { min-height: 77px; }
-.script-picker { width: min(330px, 48%); }
-.script-picker label { margin-bottom: 5px; font-size: 10px; }
-.script-picker select { padding: 8px 10px; font-size: 12px; }
+.script-picker { display: flex; gap: 10px; width: min(520px, 58%); }
+.script-picker .picker-field { flex: 1; min-width: 0; }
+.script-picker label { display: block; margin-bottom: 5px; font-size: 10px; }
+.script-picker select { width: 100%; padding: 8px 10px; font-size: 12px; }
+.script-banner { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 34px; padding: 13px 22px; background: linear-gradient(120deg, var(--primary-soft), #f2faf8); border-bottom: 1px solid #cde7e2; }
+.banner-cell span { display: block; font-size: 9px; letter-spacing: 1.6px; font-weight: 700; color: var(--muted); margin-bottom: 3px; }
+.banner-cell strong { font-size: 24px; font-weight: 800; letter-spacing: .6px; line-height: 1.1; color: var(--primary-dark); }
+.banner-flow { margin-left: auto; text-align: right; }
+.banner-flow span { display: block; font-size: 13px; font-weight: 700; }
+.banner-flow small { font-size: 10px; color: var(--muted); }
+.script-banner.no-match { background: var(--amber-soft); border-bottom-color: #f0dfae; }
+.script-banner.no-match .banner-flow span { color: var(--amber); }
 .scan-zone { padding: 20px 22px 16px; background: #f8fbfb; border-bottom: 1px solid var(--border); }
 .scan-zone form > label { color: var(--primary-dark); font-size: 11px; }
 .scan-input-row { display: grid; grid-template-columns: 35px minmax(0, 1fr) auto; align-items: center; background: #fff; border: 1px solid #a9c9c6; border-radius: 8px; overflow: hidden; box-shadow: 0 0 0 3px rgba(8,127,117,.04); }
@@ -139,6 +148,7 @@ svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width:
 .unit-details { margin: 0 20px 15px; }
 .unit-details > div { display: flex; justify-content: space-between; gap: 12px; padding: 8px 0; border-bottom: 1px dashed #e8eeee; font-size: 10px; }
 .unit-details dt { color: var(--muted); }.unit-details dd { margin: 0; font-weight: 600; text-align: right; overflow-wrap: anywhere; }
+#unit-model, #unit-station { font-size: 12px; font-weight: 800; letter-spacing: .4px; color: var(--primary-dark); background: var(--primary-soft); border: 1px solid #cde7e2; border-radius: 5px; padding: 2px 9px; }
 .operator-field { margin: 0 20px 14px; }.operator-field input { padding: 8px 10px; font-size: 11px; }
 .btn { border: 1px solid transparent; border-radius: 6px; padding: 9px 15px; font-size: 11px; font-weight: 600; transition: background .15s, border .15s, transform .05s; white-space: nowrap; }
 .btn:active:not(:disabled) { transform: translateY(1px); }
@@ -167,7 +177,7 @@ svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width:
 .script-list-item strong { display: block; font-size: 11px; margin-bottom: 5px; }.script-list-item span { display: block; font-size: 9px; color: var(--muted); }.script-list-item small { display: block; color: var(--primary); font-size: 8px; margin-top: 7px; }
 .script-list-item.disabled { opacity: .55; }
 .script-editor-card { padding: 21px; }
-.editor-meta { display: grid; grid-template-columns: 2fr 1fr 100px; gap: 14px; padding-bottom: 20px; border-bottom: 1px solid var(--border); }
+.editor-meta { display: grid; grid-template-columns: 2fr 1fr 1fr 1fr 110px 90px; gap: 14px; padding-bottom: 20px; border-bottom: 1px solid var(--border); }
 .version-box { padding: 7px 12px; border-left: 1px solid var(--border); }.version-box span { display: block; color: var(--muted); font-size: 9px; margin-bottom: 7px; }.version-box strong { font-size: 14px; }
 .editor-section-heading { display: flex; justify-content: space-between; align-items: center; gap: 15px; margin: 20px 0 14px; }.editor-section-heading p { margin: 5px 0 0; color: var(--muted); font-size: 10px; }
 .step-card { border: 1px solid #dbe5e6; border-radius: 8px; margin-bottom: 12px; overflow: hidden; }

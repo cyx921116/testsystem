@@ -95,7 +95,7 @@
           <div class="metrics-grid">
             <article class="metric-card"><span>今日测试</span><strong id="metric-today">0</strong><small>产品数量</small><i class="metric-line teal"></i></article>
             <article class="metric-card"><span>今日一次通过率</span><strong id="metric-pass-rate">—</strong><small id="metric-today-pass">0 项通过</small><i class="metric-line green"></i></article>
-            <article class="metric-card"><span>累计报告</span><strong id="metric-total">0</strong><small>一份 SN 一份报告</small><i class="metric-line blue"></i></article>
+            <article class="metric-card"><span>累计报告</span><strong id="metric-total">0</strong><small>每次测试一份报告</small><i class="metric-line blue"></i></article>
             <article class="metric-card"><span>累计失败</span><strong id="metric-failed">0</strong><small>待分析与处理</small><i class="metric-line red"></i></article>
           </div>
 
@@ -103,7 +103,16 @@
             <article class="card test-console">
               <div class="card-header console-header">
                 <div><span class="eyebrow">TEST SEQUENCE</span><h2>测试执行台</h2></div>
-                <div class="script-picker"><label for="production-script">产品 / 测试流程</label><select id="production-script"></select></div>
+                <div class="script-picker">
+                  <div class="picker-field"><label for="production-product">产品型号</label><select id="production-product"></select></div>
+                  <div class="picker-field"><label for="production-station">测试工站</label><select id="production-station"></select></div>
+                  <div class="picker-field" id="production-flow-field" hidden><label for="production-flow">测试流程</label><select id="production-flow"></select></div>
+                </div>
+              </div>
+              <div class="script-banner" id="script-banner">
+                <div class="banner-cell"><span>产品型号</span><strong id="banner-model">—</strong></div>
+                <div class="banner-cell"><span>测试工站</span><strong id="banner-station">—</strong></div>
+                <div class="banner-flow"><span id="banner-flow-name">正在加载流程…</span><small id="banner-flow-meta"></small></div>
               </div>
               <div class="scan-zone">
                 <form id="scan-form">
@@ -160,11 +169,10 @@
             <article class="card script-editor-card">
               <div class="editor-meta">
                 <div class="field span-2"><label for="draft-name">流程名称</label><input id="draft-name" data-draft-field="name"></div>
-                <div class="field"><label for="draft-model">产品型号</label><input id="draft-model" list="product-options" data-draft-field="product_model" placeholder="从 MES 产品主数据选择"></div>
-                <div class="field"><label for="draft-station">绑定工站</label><input id="draft-station" list="station-options" data-draft-field="station_code" placeholder="留空表示不限工站"></div>
+                <div class="field"><label for="draft-model">产品型号</label><select id="draft-model" data-draft-field="product_model"></select></div>
+                <div class="field"><label for="draft-station">绑定工站</label><select id="draft-station" data-draft-field="station_code"></select></div>
+                <div class="field"><label for="draft-retests">失败复测次数</label><input id="draft-retests" data-draft-field="max_retests" type="number" min="0" max="20" step="1" placeholder="跟随工位策略"></div>
                 <div class="version-box"><span>已保存版本</span><strong id="draft-version">未保存</strong></div>
-                <datalist id="product-options"></datalist>
-                <datalist id="station-options"></datalist>
               </div>
               <div class="editor-section-heading"><div><h3>测试步骤</h3><p>拖动画布节点组合逻辑，或切换为步骤列表；保存时统一编译。</p></div><div class="editor-heading-actions"><div class="editor-mode-switch"><button class="active" data-editor-mode="visual">图形画布</button><button data-editor-mode="list">步骤列表</button></div><button class="btn btn-small btn-secondary" id="add-step">+ 添加测试项</button></div></div>
               <div id="validation-results"></div>
