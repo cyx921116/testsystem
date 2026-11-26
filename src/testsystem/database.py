@@ -156,6 +156,28 @@ CREATE TABLE IF NOT EXISTS mes_upload_logs (
     created_at TEXT NOT NULL,
     FOREIGN KEY(report_id) REFERENCES reports(id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS flash_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT,
+    item_path TEXT,
+    sn TEXT NOT NULL,
+    station TEXT,
+    operator TEXT,
+    firmware_name TEXT,
+    firmware_version TEXT,
+    firmware_sha256 TEXT,
+    backend TEXT,
+    ok INTEGER NOT NULL,
+    message TEXT,
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    details_json TEXT NOT NULL DEFAULT '{}',
+    finished_at TEXT NOT NULL,
+    FOREIGN KEY(run_id) REFERENCES test_runs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_flash_records_run ON flash_records(run_id, id);
+CREATE INDEX IF NOT EXISTS idx_flash_records_sn ON flash_records(sn, id);
 """
 
 DEFAULT_MES_CONFIG = {
@@ -177,6 +199,11 @@ DEFAULT_SETTINGS = {
     "operator": "OP-001",
     "sn_pattern": r"^[A-Za-z0-9][A-Za-z0-9._-]{3,63}$",
     "auto_upload": False,
+}
+
+DEFAULT_FLASHER_CONFIG = {
+    "backend": "simulator",
+    "config": {"step_delay_ms": 50},
 }
 
 
@@ -234,7 +261,7 @@ class Database:
                         "UPDATE protocol_configs SET config_json = ? WHERE name = ?",
                         (json_dumps(merged), name),
                     )
-            for key, value in {**DEFAULT_SETTINGS, "mes": DEFAULT_MES_CONFIG}.items():
+            for key, value in {**DEFAULT_SETTINGS, "mes": DEFAULT_MES_CONFIG, "flasher": DEFAULT_FLASHER_CONFIG}.items():
                 connection.execute(
                     "INSERT OR IGNORE INTO settings(key, value_json, updated_at) VALUES (?, ?, ?)",
                     (key, json_dumps(value), now),

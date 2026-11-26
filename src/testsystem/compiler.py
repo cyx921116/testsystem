@@ -16,7 +16,7 @@ SUPPORTED_PROTOCOLS = {
     "mqtt",
     "jlink",
 }
-ACTION_TYPES = {"request", "send", "receive", "execute", "set", "assert", "sleep"}
+ACTION_TYPES = {"request", "send", "receive", "execute", "set", "assert", "sleep", "flash"}
 ASSERT_OPERATORS = {
     "equals",
     "not_equals",
@@ -154,6 +154,30 @@ def _validate_action(action: Any, path: str, errors: list[str]) -> None:
                 errors.append(f"{path}.expected 正则无效：{exc}")
     elif action_type == "sleep":
         _number(action.get("duration_ms"), f"{path}.duration_ms", errors, 0, 60000)
+    elif action_type == "flash":
+        firmware = action.get("firmware")
+        if not isinstance(firmware, str) or not firmware.strip():
+            errors.append(f"{path}.firmware 不能为空，需填写已登记的固件名称或 ID")
+        elif "${" not in firmware:
+            from .flasher import FlashError, find_firmware
+
+            try:
+                find_firmware(firmware.strip())
+            except FlashError as exc:
+                errors.append(f"{path}.firmware {exc}")
+        if "save_as" in action and not VARIABLE_PATTERN.fullmatch(str(action["save_as"])):
+            errors.append(f"{path}.save_as 不是合法变量名")
+        options = action.get("options", {})
+        if not isinstance(options, dict):
+            errors.append(f"{path}.options 必须是 JSON 对象")
+        else:
+            for key in ("erase", "verify", "reset"):
+                if key in options and not isinstance(options[key], bool):
+                    errors.append(f"{path}.options.{key} 必须是布尔值")
+            if "timeout_ms" in options:
+                _number(options["timeout_ms"], f"{path}.options.timeout_ms", errors, 1, 600000)
+        if "variables" in action and not isinstance(action["variables"], dict):
+            errors.append(f"{path}.variables 必须是 JSON 对象")
 
 
 def compile_script(source: dict[str, Any]) -> dict[str, Any]:

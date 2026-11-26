@@ -72,6 +72,7 @@ export const actionLabels: Record<string, string> = {
   set: "设置变量",
   assert: "结果断言",
   sleep: "延时等待",
+  flash: "固件烧录",
 };
 
 export const operatorLabels: Record<string, string> = {

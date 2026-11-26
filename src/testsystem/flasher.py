@@ -155,6 +155,8 @@ def build_flash_record(
     """生成可追溯的烧录记录（哪个 SN 烧了什么固件、结果如何），供后续持久化。"""
     context = context or {}
     return {
+        "run_id": context.get("run_id", ""),
+        "item": context.get("item", ""),
         "sn": request.get("sn", ""),
         "station": context.get("station", ""),
         "operator": context.get("operator", ""),

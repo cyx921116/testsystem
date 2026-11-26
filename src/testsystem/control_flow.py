@@ -21,12 +21,14 @@ class ControlFlowRunner:
         run: Any,
         script: dict[str, Any],
         protocols: dict[str, BaseProtocol],
+        flashers: dict[str, Any] | None = None,
     ):
         self.service = service
         self.db = service.db
         self.run = run
         self.script = script
         self.protocols = protocols
+        self.flashers = flashers if flashers is not None else {}
         self.sequence = 0
         self.sequence_lock = threading.Lock()
 
@@ -41,7 +43,7 @@ class ControlFlowRunner:
             "branches": {},
             "subflows": {},
         }
-        self._sequence(self.script["steps"], context, self.protocols, "root", 0)
+        self._sequence(self.script["steps"], context, self.protocols, self.flashers, "root", 0)
 
     def _next_sequence(self) -> int:
         with self.sequence_lock:
@@ -53,13 +55,14 @@ class ControlFlowRunner:
         steps: list[dict[str, Any]],
         context: dict[str, Any],
         protocols: dict[str, BaseProtocol],
+        flashers: dict[str, Any],
         path: str,
         call_depth: int,
     ) -> bool:
         success = True
         for node in steps:
             node_path = f"{path}/{node['id']}"
-            node_success = self._execute_node(node, node_path, context, protocols, call_depth)
+            node_success = self._execute_node(node, node_path, context, protocols, flashers, call_depth)
             if not node_success:
                 success = False
                 if node["on_fail"] == "stop":
@@ -72,19 +75,20 @@ class ControlFlowRunner:
         path: str,
         context: dict[str, Any],
         protocols: dict[str, BaseProtocol],
+        flashers: dict[str, Any],
         call_depth: int,
     ) -> bool:
         node_type = node["type"]
         if node_type == "test":
-            return self._execute_test(node, path, context, protocols)
+            return self._execute_test(node, path, context, protocols, flashers)
         if node_type == "condition":
-            return self._execute_condition(node, path, context, protocols, call_depth)
+            return self._execute_condition(node, path, context, protocols, flashers, call_depth)
         if node_type == "parallel":
             return self._execute_parallel(node, path, context, call_depth)
         if node_type == "loop":
-            return self._execute_loop(node, path, context, protocols, call_depth)
+            return self._execute_loop(node, path, context, protocols, flashers, call_depth)
         if node_type == "subflow":
-            return self._execute_subflow(node, path, context, protocols, call_depth)
+            return self._execute_subflow(node, path, context, protocols, flashers, call_depth)
         raise RuntimeError(f"未知控制流节点：{node_type}")
 
     def _execute_test(
@@ -93,6 +97,7 @@ class ControlFlowRunner:
         path: str,
         context: dict[str, Any],
         protocols: dict[str, BaseProtocol],
+        flashers: dict[str, Any],
     ) -> bool:
         sequence = self._next_sequence()
         iteration = context.get("iteration")
@@ -130,7 +135,10 @@ class ControlFlowRunner:
         for attempt in range(1, int(step["retries"]) + 2):
             attempts = attempt
             try:
-                actual, expected, assertions = self.service._execute_actions(step, context, protocols)
+                actual, expected, assertions = self.service._execute_actions(
+                    step, context, protocols, flashers,
+                    self.service._flash_progress(self.run["id"], path), path,
+                )
                 final_status = "PASS"
                 final_message = "测试通过"
                 break
@@ -195,6 +203,7 @@ class ControlFlowRunner:
         path: str,
         context: dict[str, Any],
         protocols: dict[str, BaseProtocol],
+        flashers: dict[str, Any],
         call_depth: int,
     ) -> bool:
         started_at = self._start_control(node, path)
@@ -205,7 +214,7 @@ class ControlFlowRunner:
             return False
         branch_name = "then" if matched else "else"
         branch_success = self._sequence(
-            node[branch_name], context, protocols, f"{path}.{branch_name}", call_depth
+            node[branch_name], context, protocols, flashers, f"{path}.{branch_name}", call_depth
         )
         self._finish_control(
             path,
@@ -233,11 +242,13 @@ class ControlFlowRunner:
         def branch_run(branch: dict[str, Any]) -> dict[str, Any]:
             branch_context = deepcopy(context)
             branch_protocols: dict[str, BaseProtocol] = {}
+            branch_flashers: dict[str, Any] = {}
             try:
                 success = self._sequence(
                     branch["steps"],
                     branch_context,
                     branch_protocols,
+                    branch_flashers,
                     f"{path}.{branch['id']}",
                     call_depth,
                 )
@@ -246,6 +257,11 @@ class ControlFlowRunner:
                 for protocol in branch_protocols.values():
                     try:
                         protocol.close()
+                    except Exception:
+                        pass
+                for flasher in branch_flashers.values():
+                    try:
+                        flasher.close()
                     except Exception:
                         pass
 
@@ -284,6 +300,7 @@ class ControlFlowRunner:
         path: str,
         context: dict[str, Any],
         protocols: dict[str, BaseProtocol],
+        flashers: dict[str, Any],
         call_depth: int,
     ) -> bool:
         started_at = self._start_control(node, path)
@@ -306,7 +323,7 @@ class ControlFlowRunner:
                     iterations.append({"iteration": iteration, "condition": False, "actual": actual, "expected": expected})
                     break
             iteration_success = self._sequence(
-                node["steps"], context, protocols, f"{path}[{iteration}]", call_depth
+                node["steps"], context, protocols, flashers, f"{path}[{iteration}]", call_depth
             )
             iterations.append({"iteration": iteration, "success": iteration_success})
             if not iteration_success:
@@ -335,6 +352,7 @@ class ControlFlowRunner:
         path: str,
         context: dict[str, Any],
         protocols: dict[str, BaseProtocol],
+        flashers: dict[str, Any],
         call_depth: int,
     ) -> bool:
         started_at = self._start_control(node, path)
@@ -349,7 +367,7 @@ class ControlFlowRunner:
         inputs = render_template(node.get("inputs", {}), context)
         child_context.update(inputs)
         success = self._sequence(
-            definition["steps"], child_context, protocols, f"{path}<{node['subflow']}>", call_depth + 1
+            definition["steps"], child_context, protocols, flashers, f"{path}<{node['subflow']}>", call_depth + 1
         )
         context.setdefault("subflows", {})[node["id"]] = child_context
         self._finish_control(

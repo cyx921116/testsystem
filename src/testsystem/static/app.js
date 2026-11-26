@@ -17,6 +17,9 @@ const state = {
   pollTimer: null,
   protocols: [],
   selectedProtocol: "simulator",
+  firmware: [],
+  flashers: [],
+  flasherConfig: {},
   mesConfig: {},
   settings: {},
   reports: [],
@@ -30,6 +33,7 @@ const pageMeta = {
   production: ["生产测试", "扫描产品 SN，执行测试并绑定唯一报告"],
   scripts: ["流程编排", "低代码编辑测试逻辑，后端统一编译执行"],
   protocols: ["通讯配置", "管理串口、总线、网络与调试器连接"],
+  firmware: ["固件烧录", "登记固件入仓，选择烧录后端并验证连接"],
   mes: ["MES 集成", "配置报告报文、接口与工位上传策略"],
   reports: ["报告中心", "按 SN 追溯测试数据与 MES 上传状态"],
   users: ["账号权限", "管理登录账号、角色和启用状态"],
@@ -42,12 +46,12 @@ const protocolSymbols = {
 
 const actionLabels = {
   request: "发送并等待响应", send: "仅发送", receive: "等待接收", execute: "设备操作",
-  set: "设置变量", assert: "结果断言", sleep: "延时等待",
+  set: "设置变量", assert: "结果断言", sleep: "延时等待", flash: "固件烧录",
 };
 
 const actionSymbols = {
   request: "REQ", send: "TX", receive: "RX", execute: "EXE",
-  set: "SET", assert: "IF", sleep: "WAIT",
+  set: "SET", assert: "IF", sleep: "WAIT", flash: "FLASH",
 };
 
 const operatorLabels = {
@@ -138,7 +142,7 @@ function parseSmartValue(value) {
 
 function navigate(page) {
   if (!pageMeta[page]) return;
-  if (state.user?.role !== "admin" && ["scripts", "protocols", "mes", "users"].includes(page)) page = "production";
+  if (state.user?.role !== "admin" && ["scripts", "protocols", "firmware", "mes", "users"].includes(page)) page = "production";
   $$(".page").forEach((element) => element.classList.toggle("active", element.id === `page-${page}`));
   $$(".nav-item").forEach((element) => element.classList.toggle("active", element.dataset.page === page));
   $("#page-title").textContent = pageMeta[page][0];
@@ -147,6 +151,7 @@ function navigate(page) {
   if (page === "production") loadDashboard();
   if (page === "scripts") renderScriptLibrary();
   if (page === "protocols") loadProtocols();
+  if (page === "firmware") loadFirmware();
   if (page === "mes") loadMesSettings();
   if (page === "reports") loadReports();
   if (page === "users") loadUsers();
@@ -379,6 +384,7 @@ function defaultAction(type = "request") {
     set: { type, variable: "expected_value", value: "PASS" },
     assert: { type, actual: "${response}", operator: "equals", expected: "PASS" },
     sleep: { type, duration_ms: 500 },
+    flash: { type, firmware: "", target: "", save_as: "flash_result", options: { erase: true, verify: true, reset: true, timeout_ms: 60000 } },
   };
   return clone(defaults[type] || defaults.request);
 }
@@ -425,6 +431,15 @@ function renderAction(action, si, ai) {
     fields += textActionField(si, ai, "message", "失败提示（可选）", action.message, true);
   } else if (action.type === "sleep") {
     fields += textActionField(si, ai, "duration_ms", "延时时长 ms", action.duration_ms, false, "number");
+  } else if (action.type === "flash") {
+    const options = action.options || {};
+    fields += textActionField(si, ai, "firmware", "固件名称或 ID / 支持 ${变量}", action.firmware, true);
+    fields += textActionField(si, ai, "target", "目标槽位（可选）", action.target);
+    fields += textActionField(si, ai, "save_as", "结果保存为", action.save_as);
+    fields += textActionField(si, ai, "timeout_ms", "烧录超时 ms", options.timeout_ms ?? 60000, false, "number");
+    for (const [key, label] of [["erase", "烧录前擦除"], ["verify", "烧录后校验"], ["reset", "烧录后复位"]]) {
+      fields += `<div class="action-field"><label>${label}</label><select data-action-field data-s="${si}" data-a="${ai}" data-key="${key}">${optionTags({ true: "是", false: "否" }, String(options[key] ?? true))}</select></div>`;
+    }
   }
   return `<div class="action-row">
     <div class="action-type"><label>动作 ${ai + 1}</label><select data-action-type data-s="${si}" data-a="${ai}">${optionTags(actionLabels, action.type)}</select></div>
@@ -450,6 +465,7 @@ function actionSummary(action) {
     return `${displayValue(action.actual)} ${operatorLabels[action.operator] || action.operator}${expected}`;
   }
   if (action.type === "sleep") return `等待 ${action.duration_ms} ms`;
+  if (action.type === "flash") return `烧录 ${action.firmware || "未选择固件"}${action.save_as ? ` → ${action.save_as}` : ""}`;
   return action.type;
 }
 
@@ -678,6 +694,11 @@ function updateActionField(element) {
   if (!action) return;
   const key = element.dataset.key;
   let value = element.value;
+  if (action.type === "flash" && ["erase", "verify", "reset", "timeout_ms"].includes(key)) {
+    action.options ||= {};
+    action.options[key] = key === "timeout_ms" ? Number(value) : value === "true";
+    return;
+  }
   if (["timeout_ms", "size", "duration_ms"].includes(key)) value = Number(value);
   if (key === "params") {
     try { value = JSON.parse(value); } catch { return; }
@@ -966,6 +987,86 @@ async function testProtocol() {
   }
 }
 
+async function loadFirmware() {
+  try {
+    const [firmware, flashers, config] = await Promise.all([
+      api("/api/firmware"), api("/api/flashers"), api("/api/flasher/config"),
+    ]);
+    state.firmware = firmware;
+    state.flashers = flashers;
+    state.flasherConfig = config;
+    renderFirmware();
+  } catch (error) { toast(error.message, "error"); }
+}
+
+function renderFirmware() {
+  $("#firmware-count").textContent = state.firmware.length;
+  $("#firmware-table").innerHTML = state.firmware.length ? state.firmware.map((item) => `
+    <tr>
+      <td><span class="sn-primary">${escapeHtml(item.name)}</span><span class="sn-secondary">${escapeHtml(item.description || "")}</span></td>
+      <td><span class="sn-primary">v${escapeHtml(item.version)}</span><span class="sn-secondary">${escapeHtml(item.product_model || "通用")}</span></td>
+      <td>${(Number(item.size || 0) / 1024).toFixed(1)} KB</td>
+      <td><span class="sn-secondary mono" title="${escapeHtml(item.sha256)}">${escapeHtml(String(item.sha256 || "").slice(0, 16))}…</span></td>
+      <td>${escapeHtml(formatTime(item.registered_at))}</td>
+      <td><button class="btn btn-secondary" data-verify-firmware="${escapeHtml(item.name)}">校验</button></td>
+    </tr>`).join("") : '<tr><td colspan="6" class="empty-row">固件仓为空，请先登记固件</td></tr>';
+  $("#flasher-backend").innerHTML = state.flashers.map((item) =>
+    `<option value="${escapeHtml(item.name)}" ${item.name === state.flasherConfig.backend ? "selected" : ""}>${escapeHtml(item.name)}${item.driver_available ? "" : "（驱动缺失）"} · ${escapeHtml(item.description)}</option>`).join("");
+  $("#flasher-config").value = JSON.stringify(state.flasherConfig.config || {}, null, 2);
+  $("#flasher-test-result").textContent = "";
+  $("#flasher-test-result").className = "";
+}
+
+async function registerFirmware(event) {
+  event.preventDefault();
+  try {
+    const entry = await api("/api/firmware", { method: "POST", body: {
+      source: $("#firmware-source").value.trim(),
+      version: $("#firmware-version").value.trim(),
+      product_model: $("#firmware-model").value.trim(),
+      description: $("#firmware-description").value.trim(),
+    } });
+    $("#firmware-form").reset();
+    toast(`固件 ${entry.name} v${entry.version} 已登记入仓`, "success");
+    await loadFirmware();
+  } catch (error) { toast(error.message, "error"); }
+}
+
+async function verifyFirmware(button) {
+  button.disabled = true;
+  try {
+    const result = await api(`/api/firmware/${encodeURIComponent(button.dataset.verifyFirmware)}/verify`, { method: "POST" });
+    toast(result.message, "success");
+  } catch (error) { toast(error.message, "error"); }
+  finally { button.disabled = false; }
+}
+
+async function saveFlasherConfig(showToast = true) {
+  const config = parseJsonField($("#flasher-config").value, "烧录后端参数");
+  if (!config || Array.isArray(config) || typeof config !== "object") throw new Error("烧录后端参数必须是 JSON 对象");
+  const saved = await api("/api/flasher/config", { method: "PUT", body: { backend: $("#flasher-backend").value, config } });
+  state.flasherConfig = saved;
+  if (showToast) toast("烧录后端配置已保存", "success");
+  return saved;
+}
+
+async function testFlasher() {
+  const result = $("#flasher-test-result");
+  result.className = "";
+  result.textContent = "正在检查…";
+  try {
+    const saved = await saveFlasherConfig(false);
+    const response = await api("/api/flasher/test", { method: "POST", body: saved });
+    result.className = response.ok ? "success" : "error";
+    result.textContent = response.message;
+    toast(response.message, response.ok ? "success" : "error");
+  } catch (error) {
+    result.className = "error";
+    result.textContent = error.message;
+    toast(error.message, "error");
+  }
+}
+
 function applyStationSettings(settings) {
   state.settings = settings;
   $("#setting-station").value = settings.station_id;
@@ -1084,6 +1185,7 @@ async function viewReport(reportId) {
           ${report.items.map((item, index) => `<tr><td>${index + 1}</td><td><span class="sn-primary">${escapeHtml(item.name)}</span><span class="sn-secondary">${escapeHtml(item.message || "")}</span>${item.assertions?.length ? `<details><summary class="text-button">断言明细</summary><pre class="assertion-detail">${escapeHtml(JSON.stringify(item.assertions, null, 2))}</pre></details>` : ""}</td><td><span class="sn-primary">${escapeHtml(displayValue(item.actual))}</span><span class="sn-secondary">期望 ${escapeHtml(displayValue(item.expected))}</span></td><td>${item.attempts || 0}</td><td>${formatDuration(item.duration_ms)}</td><td>${statusBadge(item.status)}</td></tr>`).join("")}
         </tbody></table></div>
         ${report.controls?.length ? `<h3 class="report-section-title">控制流执行记录</h3><div class="table-wrap"><table class="data-table"><thead><tr><th>节点</th><th>类型</th><th>路径</th><th>结果</th><th>明细</th></tr></thead><tbody>${report.controls.map((control) => `<tr><td>${escapeHtml(control.name)}</td><td>${escapeHtml(control.type)}</td><td><span class="sn-secondary">${escapeHtml(control.path)}</span></td><td>${statusBadge(control.status)}</td><td><details><summary class="text-button">查看</summary><pre class="assertion-detail">${escapeHtml(JSON.stringify(control.details, null, 2))}</pre></details></td></tr>`).join("")}</tbody></table></div>` : ""}
+        ${report.flash_records?.length ? `<h3 class="report-section-title">固件烧录记录</h3><div class="table-wrap"><table class="data-table"><thead><tr><th>固件</th><th>版本</th><th>后端</th><th>结果</th><th>耗时</th><th>完成时间</th></tr></thead><tbody>${report.flash_records.map((record) => `<tr><td><span class="sn-primary">${escapeHtml(record.firmware?.name || "")}</span><span class="sn-secondary mono" title="${escapeHtml(record.firmware?.sha256 || "")}">${escapeHtml(String(record.firmware?.sha256 || "").slice(0, 16))}…</span></td><td>${escapeHtml(record.firmware?.version || "")}</td><td>${escapeHtml(record.backend)}</td><td>${statusBadge(record.ok ? "PASS" : "FAIL")}<span class="sn-secondary">${escapeHtml(record.message || "")}</span></td><td>${formatDuration(record.duration_ms)}</td><td>${escapeHtml(formatTime(record.finished_at))}</td></tr>`).join("")}</tbody></table></div>` : ""}
         <div class="report-mes-info"><strong>MES：${escapeHtml(mesStatusText(report.mes_status))}</strong> · 已尝试 ${report.mes_attempts} 次${report.uploaded_at ? ` · ${escapeHtml(formatTime(report.uploaded_at))}` : ""}${report.mes_response ? `<br>响应：${escapeHtml(report.mes_response)}` : ""}</div>
         ${logs.length ? `<details class="advanced-editor"><summary>MES 上传日志 <span>${logs.length} 条</span></summary><pre class="json-preview">${escapeHtml(JSON.stringify(logs, null, 2))}</pre></details>` : ""}
       </div>
@@ -1270,6 +1372,11 @@ function bindEvents() {
     try { await saveProtocol(); } catch (error) { toast(error.message, "error"); }
   });
   $("#test-protocol").addEventListener("click", testProtocol);
+  $("#firmware-form").addEventListener("submit", registerFirmware);
+  $("#save-flasher").addEventListener("click", async () => {
+    try { await saveFlasherConfig(); } catch (error) { toast(error.message, "error"); }
+  });
+  $("#test-flasher").addEventListener("click", testFlasher);
   $("#protocol-tabs").addEventListener("click", (event) => {
     const button = event.target.closest("[data-protocol]");
     if (button) { state.selectedProtocol = button.dataset.protocol; renderProtocols(); }
@@ -1292,6 +1399,8 @@ function bindEvents() {
     if (toggleUserButton) toggleUser(toggleUserButton);
     const resetUserButton = event.target.closest("[data-reset-user]");
     if (resetUserButton) resetUserPassword(resetUserButton);
+    const verifyFirmwareButton = event.target.closest("[data-verify-firmware]");
+    if (verifyFirmwareButton) verifyFirmware(verifyFirmwareButton);
     if (event.target.closest("[data-close-modal]")) closeReport();
     if (event.target.closest("[data-print-report]")) window.print();
   });

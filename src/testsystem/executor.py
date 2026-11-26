@@ -8,7 +8,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from typing import Any
 
-from .database import Database
+from .database import DEFAULT_FLASHER_CONFIG, Database
+from .flasher import FlashError, build_flash_record, create_flasher
 from .protocols import BaseProtocol, ProtocolError, create_protocol
 from .utils import json_dumps, new_id, render_template, utc_now
 
@@ -92,11 +93,84 @@ class TestExecutor:
             protocol.set_context(context)
         return protocol
 
+    def _flasher(self, cache: dict[str, Any]) -> Any:
+        if "active" not in cache:
+            config = self.db.setting("flasher", DEFAULT_FLASHER_CONFIG)
+            cache["active"] = create_flasher(config.get("backend", "simulator"), config.get("config") or {})
+        return cache["active"]
+
+    def _record_flash(self, request: dict[str, Any], result: dict[str, Any], context: dict[str, Any]) -> None:
+        record = build_flash_record(request, result, context)
+        firmware = record.get("firmware") or {}
+        self.db.execute(
+            "INSERT INTO flash_records(run_id, item_path, sn, station, operator, firmware_name, firmware_version, "
+            "firmware_sha256, backend, ok, message, duration_ms, details_json, finished_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                record["run_id"],
+                record["item"],
+                record["sn"],
+                record["station"],
+                record["operator"],
+                firmware.get("name", ""),
+                firmware.get("version", ""),
+                firmware.get("sha256", ""),
+                record["backend"],
+                int(record["ok"]),
+                record["message"],
+                int(record["duration_ms"]),
+                json_dumps(record["details"]),
+                record["finished_at"],
+            ),
+        )
+
+    def _execute_flash(
+        self,
+        action: dict[str, Any],
+        step: dict[str, Any],
+        context: dict[str, Any],
+        flashers: dict[str, Any],
+        on_progress: Any,
+        item_path: str,
+    ) -> dict[str, Any]:
+        flasher = self._flasher(flashers)
+        request = {
+            "firmware": render_template(action["firmware"], context),
+            "sn": str(context.get("sn", "")),
+            "target": render_template(action.get("target", ""), context),
+            "options": render_template(action.get("options", {}), context),
+            "variables": render_template(action.get("variables", {}), context),
+        }
+        record_context = {
+            "run_id": str(context.get("run_id", "")),
+            "item": item_path or str(step.get("id", "")),
+            "station": str(context.get("station", "")),
+            "operator": str(context.get("operator", "")),
+        }
+        try:
+            result = flasher.flash(request, on_progress=on_progress)
+        except FlashError as exc:
+            self._record_flash(request, {
+                "ok": False,
+                "backend": flasher.name,
+                "firmware": {},
+                "message": str(exc),
+                "duration_ms": 0,
+                "details": {},
+                "finished_at": utc_now(),
+            }, record_context)
+            raise StepFailure(f"固件烧录失败：{exc}") from exc
+        self._record_flash(request, result, record_context)
+        return result
+
     def _execute_actions(
         self,
         step: dict[str, Any],
         context: dict[str, Any],
         protocols: dict[str, BaseProtocol],
+        flashers: dict[str, Any] | None = None,
+        on_progress: Any = None,
+        item_path: str = "",
     ) -> tuple[Any, Any, list[dict[str, Any]]]:
         started = time.monotonic()
         last_value: Any = None
@@ -117,6 +191,15 @@ class TestExecutor:
                 continue
             if action_type == "set":
                 context[action["variable"]] = render_template(action.get("value"), context)
+                continue
+            if action_type == "flash":
+                result = self._execute_flash(
+                    action, step, context, flashers if flashers is not None else {}, on_progress, item_path
+                )
+                last_value = result["message"]
+                context["last_response"] = result
+                if action.get("save_as"):
+                    context[action["save_as"]] = result
                 continue
 
             protocol = self._protocol(step["protocol"], protocols, context)
@@ -165,10 +248,20 @@ class TestExecutor:
                     raise StepFailure(message, actual=actual, expected=expected, assertions=assertions)
         return last_value, last_expected, assertions
 
+    def _flash_progress(self, run_id: str, item_id: str) -> Any:
+        def report(percent: int, message: str) -> None:
+            self.db.execute(
+                "UPDATE test_items SET message = ? WHERE run_id = ? AND item_id = ?",
+                (f"烧录 {percent}%：{message}", run_id, item_id),
+            )
+
+        return report
+
     def _run_safely(self, run_id: str) -> None:
         protocols: dict[str, BaseProtocol] = {}
+        flashers: dict[str, Any] = {}
         try:
-            self._execute_run(run_id, protocols)
+            self._execute_run(run_id, protocols, flashers)
         except Exception as exc:
             now = utc_now()
             self.db.execute(
@@ -186,6 +279,11 @@ class TestExecutor:
                     protocol.close()
                 except Exception:
                     pass
+            for flasher in flashers.values():
+                try:
+                    flasher.close()
+                except Exception:
+                    pass
         try:
             report_id = self._finalize(run_id)
             if self.db.setting("auto_upload", False):
@@ -201,7 +299,7 @@ class TestExecutor:
                 ("报告生成失败，请联系管理员", utc_now(), run_id),
             )
 
-    def _execute_run(self, run_id: str, protocols: dict[str, BaseProtocol]) -> None:
+    def _execute_run(self, run_id: str, protocols: dict[str, BaseProtocol], flashers: dict[str, Any]) -> None:
         run = self.db.one("SELECT * FROM test_runs WHERE id = ?", (run_id,))
         if run is None or run["status"] != "RUNNING":
             return
@@ -209,7 +307,7 @@ class TestExecutor:
         if script.get("schema_version") == 2:
             from .control_flow import ControlFlowRunner
 
-            ControlFlowRunner(self, run, script, protocols).execute()
+            ControlFlowRunner(self, run, script, protocols, flashers).execute()
             return
         context: dict[str, Any] = {
             **script.get("variables", {}),
@@ -248,7 +346,9 @@ class TestExecutor:
             for attempt in range(1, max_attempts + 1):
                 attempts = attempt
                 try:
-                    actual, expected, assertions = self._execute_actions(step, context, protocols)
+                    actual, expected, assertions = self._execute_actions(
+                        step, context, protocols, flashers, self._flash_progress(run_id, step["id"]), step["id"]
+                    )
                     final_status = "PASS"
                     final_message = "测试通过"
                     break
@@ -322,6 +422,9 @@ class TestExecutor:
             controls = connection.execute(
                 "SELECT * FROM control_events WHERE run_id = ? ORDER BY id", (run_id,)
             ).fetchall()
+            flash_records = connection.execute(
+                "SELECT * FROM flash_records WHERE run_id = ? ORDER BY id", (run_id,)
+            ).fetchall()
             if any(control["status"] in {"FAIL", "RUNNING", "INTERRUPTED"} for control in controls):
                 status = "FAIL"
             report = {
@@ -356,6 +459,24 @@ class TestExecutor:
                         "finished_at": control["finished_at"],
                     }
                     for control in controls
+                ],
+                "flash_records": [
+                    {
+                        "item_path": record["item_path"],
+                        "sn": record["sn"],
+                        "firmware": {
+                            "name": record["firmware_name"],
+                            "version": record["firmware_version"],
+                            "sha256": record["firmware_sha256"],
+                        },
+                        "backend": record["backend"],
+                        "ok": bool(record["ok"]),
+                        "message": record["message"],
+                        "duration_ms": record["duration_ms"],
+                        "details": json.loads(record["details_json"]),
+                        "finished_at": record["finished_at"],
+                    }
+                    for record in flash_records
                 ],
             }
             connection.execute(

@@ -55,17 +55,21 @@
           <svg viewBox="0 0 24 24"><path d="M8 12h8M12 8v8M5 3H3v4m16-4h2v4M5 21H3v-4m16 4h2v-4M7 7h10v10H7z"/></svg>
           <span>通讯配置</span><small>03</small>
         </button>
+        <button class="nav-item" data-page="firmware" data-admin-only>
+          <svg viewBox="0 0 24 24"><path d="M9 2v3m6-3v3M9 19v3m6-3v3M2 9h3m-3 6h3m14-6h3m-3 6h3M7 5h10v14H7zM10 9h4v6h-4z"/></svg>
+          <span>固件烧录</span><small>04</small>
+        </button>
         <button class="nav-item" data-page="mes" data-admin-only>
           <svg viewBox="0 0 24 24"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 15v5h14v-5"/></svg>
-          <span>MES 集成</span><small>04</small>
+          <span>MES 集成</span><small>05</small>
         </button>
         <button class="nav-item" data-page="reports">
           <svg viewBox="0 0 24 24"><path d="M6 3h9l4 4v14H6zM15 3v5h4M9 12h6M9 16h6"/></svg>
-          <span>报告中心</span><small>05</small>
+          <span>报告中心</span><small>06</small>
         </button>
         <button class="nav-item" data-page="users" data-admin-only>
           <svg viewBox="0 0 24 24"><path d="M16 20v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 10a4 4 0 1 0 0-8 4 4 0 0 0 0 8M19 8v6M16 11h6"/></svg>
-          <span>账号权限</span><small>06</small>
+          <span>账号权限</span><small>07</small>
         </button>
       </nav>
       <div class="user-session">
@@ -179,6 +183,36 @@
               <details class="advanced-editor"><summary>完整 JSON 配置 <span>可填写驱动特定的扩展参数</span></summary><textarea id="protocol-json" spellcheck="false"></textarea></details>
               <div class="form-actions"><button class="btn btn-primary" id="save-protocol">保存配置</button><button class="btn btn-secondary" id="test-protocol">测试连接</button><span id="protocol-test-result"></span></div>
             </article>
+          </div>
+        </section>
+
+        <section class="page" id="page-firmware">
+          <div class="page-toolbar"><div><h2>固件烧录管理</h2><p>固件登记入仓并记录 SHA-256 校验和，防止烧入被替换的文件；测试流程通过“固件烧录”动作引用已登记固件。</p></div></div>
+          <div class="mes-layout">
+            <article class="card">
+              <div class="card-header"><div><span class="eyebrow">FIRMWARE REPOSITORY</span><h2>固件仓清单</h2></div><span id="firmware-count" class="count-badge">0</span></div>
+              <div class="table-wrap"><table class="data-table"><thead><tr><th>固件</th><th>版本 / 型号</th><th>大小</th><th>SHA-256</th><th>登记时间</th><th>操作</th></tr></thead><tbody id="firmware-table"></tbody></table></div>
+            </article>
+            <div class="stacked-cards">
+              <article class="card config-card">
+                <div class="card-header"><div><span class="eyebrow">REGISTER</span><h2>登记固件</h2></div></div>
+                <form id="firmware-form" class="config-grid single">
+                  <div class="field"><label for="firmware-source">固件文件路径（工作站本地）</label><input id="firmware-source" placeholder="D:\firmware\app_v1.2.0.bin" required></div>
+                  <div class="field"><label for="firmware-version">固件版本</label><input id="firmware-version" placeholder="1.2.0" required></div>
+                  <div class="field"><label for="firmware-model">适用产品型号（可选）</label><input id="firmware-model" placeholder="DEMO-100"></div>
+                  <div class="field"><label for="firmware-description">说明（可选）</label><input id="firmware-description" placeholder="量产固件"></div>
+                  <button class="btn btn-primary btn-block" type="submit">登记入仓</button>
+                </form>
+              </article>
+              <article class="card config-card">
+                <div class="card-header"><div><span class="eyebrow">FLASHER BACKEND</span><h2>烧录后端</h2></div></div>
+                <div class="config-grid single">
+                  <div class="field"><label for="flasher-backend">后端类型</label><select id="flasher-backend"></select></div>
+                  <div class="field"><label for="flasher-config">后端参数（JSON）</label><textarea id="flasher-config" class="code-input" rows="6" spellcheck="false"></textarea><small>仿真器：step_delay_ms、fail_at_stage；J-Link：chip_name、interface、speed_khz、base_address；外部工具：command、timeout_ms、success_text。</small></div>
+                </div>
+                <div class="form-actions"><button class="btn btn-primary" id="save-flasher">保存后端配置</button><button class="btn btn-secondary" id="test-flasher">测试连接</button><span id="flasher-test-result"></span></div>
+              </article>
+            </div>
           </div>
         </section>
 

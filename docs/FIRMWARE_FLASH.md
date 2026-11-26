@@ -8,7 +8,7 @@
 - 烧录后端与具体烧录器解耦，同一套流程可换 J-Link、外部 CLI 工具或仿真器；
 - 烧录结果生成可追溯记录，为后续写入数据库和报告做准备。
 
-当前是**框架阶段**：`flasher.py` 已可独立使用（仿真器和外部工具后端可真实跑通），但尚未接入编译器、执行器和前端，不会影响现有测试流程。后续接入路线见第 6 节。
+当前**已接入主系统**：流程脚本通过 `flash` 动作烧录已登记固件，烧录器连接由执行器按工位配置管理，结果写入 `flash_records` 表并随运行和报告追溯，前端提供固件管理页面和烧录动作字段。接入方式见第 6 节。J-Link 后端的安全解锁和量产校验仍是 TODO，量产前必须按芯片封装。
 
 ## 2. 总体结构
 
@@ -74,6 +74,15 @@ flasher.py
 
 `validate_flash_request()` 负责规范化：固件必须已登记，选项与 `default_flash_options()` 合并，超时必须是正数。
 
+在测试流程脚本中，一次烧录就是一个 `flash` 动作（v1 步骤与 v2 测试节点均可使用）：
+
+```json
+{"type": "flash", "firmware": "app_v1.2.0.bin", "save_as": "flash_result",
+ "options": {"erase": true, "verify": true, "reset": true, "timeout_ms": 60000}}
+```
+
+`firmware` 支持 `${变量}` 在运行时解析；`save_as` 保存烧录结果，后续动作可用 `${flash_result.firmware.version}` 等路径断言；`target`、`variables` 会透传给烧录后端（如外部工具命令模板）。
+
 ## 5. 烧录后端
 
 ### 5.1 统一接口 `BaseFlasher`
@@ -126,15 +135,16 @@ J-Link 烧录骨架，流程为：连接（复用通讯配置中的 `dll_path`�
 - `create_flasher(name, config)`：按名称创建后端，未知名称抛 `FlashError`；
 - `flasher_catalog()`：列出后端名称、说明和驱动可用状态（`pylink` 未安装时 `jlink` 标记为不可用），风格与 `protocol_catalog()` 一致，供未来配置页面使用。
 
-## 6. 后续接入路线
+## 6. 主系统接入
 
-框架就绪后，按以下顺序接入主系统：
+固件烧录已按以下方式接入主系统：
 
-1. **编译器**：在 `compiler.py` / `control_compiler.py` 增加 `flash` 动作类型（或独立烧录节点），校验固件名称已登记、选项合法；前端 `defaultAction()`/`renderAction()` 提供烧录字段。
-2. **执行器**：`executor.py` 的 `_execute_actions()` 增加 `flash` 分支，调用 `create_flasher()` 执行；烧录失败按步骤失败处理（重试/`on_fail`）。
-3. **数据库**：新增 `flash_records` 表保存 `build_flash_record()` 的结果（SN、固件 ID/版本/校验和、后端、结果、耗时、时间），随运行和报告一起追溯。
-4. **前端**：生产测试页增加烧录进度展示；固件管理页面提供登记、清单、校验和查看；配置页面选择烧录后端并测试 `probe()`。
-5. **MES**：如需上报烧录事件，复用现有 MES 报文映射，`${firmware.version}` 等字段进入映射上下文。
+1. **编译器**：`compiler.py` 的 `ACTION_TYPES` 包含 `flash`，`_validate_action()` 校验固件名称非空且已登记（含 `${变量}` 的固件名留到运行时解析）、`options` 中擦除/校验/复位为布尔值、超时为正数；v2 控制流经 `control_compiler.py` 复用同一校验。
+2. **执行器**：`executor.py` 的 `_execute_actions()` 增加 `flash` 分支，按工位烧录配置（settings 表 `flasher` 键）经 `create_flasher()` 创建烧录器并在运行内缓存复用；烧录进度通过 `on_progress` 回调实时写入测试项消息，前端轮询即可看到“烧录 40%：写入固件”；`FlashError` 转换为 `StepFailure`，按步骤失败处理（重试/`on_fail`）；并行分支使用独立烧录器实例，运行结束统一关闭。
+3. **数据库**：`flash_records` 表保存每次烧录的 `build_flash_record()` 结果（运行、测试项路径、SN、固件名称/版本/校验和、后端、结果、耗时、时间），`/api/test-runs/{id}` 与正式报告 JSON 均携带记录。
+4. **前端**：脚本编辑器（列表与 React 画布）提供“固件烧录”动作字段；“固件烧录”管理页提供固件登记、清单、SHA-256 校验和后端选择、`probe()` 测试；生产测试页经测试项消息展示烧录进度；报告详情展示烧录记录。
+5. **API**：`/api/firmware`（清单/登记/校验）、`/api/flashers`（后端目录）、`/api/flasher/config`（后端配置）、`/api/flasher/test`（连接测试），均仅管理员可用。
+6. **MES**：如需上报烧录事件，复用现有 MES 报文映射，`${report.flash_records}` 等字段可进入映射上下文。
 
 ## 7. 安全与生产注意
 

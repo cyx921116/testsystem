@@ -17,6 +17,7 @@ export function createAction(type: string): Action {
     set: { type, variable: "expected_value", value: "PASS" },
     assert: { type, actual: "${response}", operator: "equals", expected: "PASS" },
     sleep: { type, duration_ms: 500 },
+    flash: { type, firmware: "", target: "", save_as: "flash_result", options: { erase: true, verify: true, reset: true, timeout_ms: 60000 } },
   };
   return clone(defaults[type] || defaults.request);
 }

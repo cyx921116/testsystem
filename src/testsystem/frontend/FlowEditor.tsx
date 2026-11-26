@@ -55,6 +55,7 @@ function actionSummary(action: Action): string {
   if (action.type === "execute") return String(action.operation ?? "");
   if (action.type === "set") return `${String(action.variable)} = ${String(action.value)}`;
   if (action.type === "sleep") return `${String(action.duration_ms)} ms`;
+  if (action.type === "flash") return `烧录 ${String(action.firmware || "未选择固件")}`;
   return String(action.save_as ?? action.type);
 }
 
@@ -554,6 +555,28 @@ function ActionFields({ action, protocol, onChange }: { action: Action; protocol
     </>}
     {action.type === "assert" && <AssertionFields value={action as unknown as Assertion} onChange={(assertion) => onChange({ ...assertion, type: "assert" })} />}
     {action.type === "sleep" && <Field label="延时 ms"><input type="number" min={0} value={Number(action.duration_ms || 0)} onChange={(event) => update({ duration_ms: Number(event.target.value) })} /></Field>}
+    {action.type === "flash" && <FlashFields action={action} onChange={onChange} />}
+  </>;
+}
+
+function FlashFields({ action, onChange }: { action: Action; onChange: (action: Action) => void }) {
+  const options = (action.options || {}) as Record<string, unknown>;
+  const update = (patch: Partial<Action>) => onChange({ ...action, ...patch });
+  const updateOption = (key: string, value: unknown) => update({ options: { ...options, [key]: value } });
+  return <>
+    <Field label="固件名称或 ID" hint="必须已在“固件烧录”页面登记入仓；也可填 ${变量} 在运行时解析。"><input value={String(action.firmware ?? "")} onChange={(event) => update({ firmware: event.target.value })} /></Field>
+    <div className="pilot-field-grid">
+      <Field label="目标槽位（可选）"><input value={String(action.target ?? "")} onChange={(event) => update({ target: event.target.value })} /></Field>
+      <Field label="结果保存为" hint="保存烧录结果，可断言 ${变量.firmware.version}"><input value={String(action.save_as ?? "")} onChange={(event) => update({ save_as: event.target.value })} /></Field>
+    </div>
+    <div className="pilot-field-grid">
+      <Field label="烧录超时 ms"><input type="number" min={1} value={Number(options.timeout_ms ?? 60000)} onChange={(event) => updateOption("timeout_ms", Number(event.target.value))} /></Field>
+      {(["erase", "verify", "reset"] as const).map((key) => (
+        <Field key={key} label={{ erase: "烧录前擦除", verify: "烧录后校验", reset: "烧录后复位" }[key]}>
+          <select value={String(options[key] ?? true)} onChange={(event) => updateOption(key, event.target.value === "true")}><option value="true">是</option><option value="false">否</option></select>
+        </Field>
+      ))}
+    </div>
   </>;
 }
 

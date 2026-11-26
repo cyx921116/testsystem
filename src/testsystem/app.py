@@ -15,8 +15,17 @@ from pydantic import BaseModel, Field
 from .auth import SESSION_COOKIE, AuthService, create_auth_router
 from .compiler import ScriptValidationError, SUPPORTED_PROTOCOLS, compile_script
 from .data_codec import DataCodecError, validate_codec_config
-from .database import DEFAULT_MES_CONFIG, DEFAULT_SETTINGS, Database
+from .database import DEFAULT_FLASHER_CONFIG, DEFAULT_MES_CONFIG, DEFAULT_SETTINGS, Database
 from .executor import TestExecutor
+from .flasher import (
+    FLASHER_CLASSES,
+    FlashError,
+    create_flasher,
+    find_firmware,
+    flasher_catalog,
+    load_firmware_index,
+    register_firmware,
+)
 from .mes import MESUploadError, MESUploader, build_payload
 from .protocol_definitions import DEFAULT_PROTOCOL_CONFIGS
 from .protocols import ProtocolError, create_protocol, protocol_catalog
@@ -96,6 +105,18 @@ class SettingsPayload(BaseModel):
     auto_upload: bool = False
 
 
+class FirmwareRegisterPayload(BaseModel):
+    source: str = Field(min_length=1, max_length=500)
+    version: str = Field(min_length=1, max_length=64)
+    product_model: str = Field(default="", max_length=64)
+    description: str = Field(default="", max_length=500)
+
+
+class FlasherConfigPayload(BaseModel):
+    backend: str = Field(min_length=1, max_length=32)
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
 def _script(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "id": row["id"],
@@ -135,6 +156,7 @@ def _run(run_id: str) -> dict[str, Any]:
     items = database.all("SELECT * FROM test_items WHERE run_id = ? ORDER BY sequence", (run_id,))
     report = database.one("SELECT id, report_no, mes_status FROM reports WHERE run_id = ?", (run_id,))
     controls = database.all("SELECT * FROM control_events WHERE run_id = ? ORDER BY id", (run_id,))
+    flash_records = database.all("SELECT * FROM flash_records WHERE run_id = ? ORDER BY id", (run_id,))
     return {
         "id": row["id"],
         "sn": row["sn"],
@@ -183,6 +205,20 @@ def _run(run_id: str) -> dict[str, Any]:
                 "finished_at": control["finished_at"],
             }
             for control in controls
+        ],
+        "flash_records": [
+            {
+                "item_path": record["item_path"],
+                "sn": record["sn"],
+                "firmware_name": record["firmware_name"],
+                "firmware_version": record["firmware_version"],
+                "backend": record["backend"],
+                "ok": bool(record["ok"]),
+                "message": record["message"],
+                "duration_ms": record["duration_ms"],
+                "finished_at": record["finished_at"],
+            }
+            for record in flash_records
         ],
     }
 
@@ -354,6 +390,61 @@ def test_protocol(name: str, payload: ConfigPayload) -> dict[str, Any]:
     finally:
         try:
             protocol.close()
+        except Exception:
+            pass
+
+
+@app.get("/api/firmware")
+def list_firmware() -> list[dict[str, Any]]:
+    return load_firmware_index()
+
+
+@app.post("/api/firmware", status_code=201)
+def register_firmware_api(payload: FirmwareRegisterPayload) -> dict[str, Any]:
+    try:
+        return register_firmware(payload.source, payload.version, payload.product_model, payload.description)
+    except FlashError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/firmware/{name}/verify")
+def verify_firmware(name: str) -> dict[str, Any]:
+    try:
+        entry = find_firmware(name)
+    except FlashError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return {"ok": True, "message": f"固件 {entry['name']} 校验通过，SHA-256 与登记一致", "firmware": entry}
+
+
+@app.get("/api/flashers")
+def get_flashers() -> list[dict[str, Any]]:
+    return flasher_catalog()
+
+
+@app.get("/api/flasher/config")
+def get_flasher_config() -> dict[str, Any]:
+    return database.setting("flasher", DEFAULT_FLASHER_CONFIG)
+
+
+@app.put("/api/flasher/config")
+def save_flasher_config(payload: FlasherConfigPayload) -> dict[str, Any]:
+    if payload.backend not in FLASHER_CLASSES:
+        raise HTTPException(422, f"不支持的烧录后端：{payload.backend}")
+    config = {"backend": payload.backend, "config": payload.config}
+    database.save_setting("flasher", config)
+    return config
+
+
+@app.post("/api/flasher/test")
+def test_flasher(payload: FlasherConfigPayload) -> dict[str, Any]:
+    if payload.backend not in FLASHER_CLASSES:
+        raise HTTPException(422, f"不支持的烧录后端：{payload.backend}")
+    flasher = create_flasher(payload.backend, payload.config)
+    try:
+        return flasher.probe()
+    finally:
+        try:
+            flasher.close()
         except Exception:
             pass
 
