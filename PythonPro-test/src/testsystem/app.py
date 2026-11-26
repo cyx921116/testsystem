@@ -28,6 +28,7 @@ from .flasher import (
     register_firmware,
 )
 from .mes import MESUploadError, MESUploader, build_payload
+from .mes_master import MESMasterConflictError, MESMasterData, MESMasterError, MESMasterMissingError, MESSyncError
 from .protocol_definitions import DEFAULT_PROTOCOL_CONFIGS
 from .protocols import ProtocolError, create_protocol, protocol_catalog
 from .utils import json_dumps, new_id, utc_now
@@ -64,7 +65,15 @@ def _operator_allowed(method: str, path: str) -> bool:
         return False
     return any(
         path == root or path.startswith(f"{root}/")
-        for root in ("/api/dashboard", "/api/scripts", "/api/settings", "/api/test-runs", "/api/reports")
+        for root in (
+            "/api/dashboard",
+            "/api/scripts",
+            "/api/settings",
+            "/api/test-runs",
+            "/api/reports",
+            "/api/mes/products",
+            "/api/mes/stations",
+        )
     )
 
 
@@ -119,17 +128,60 @@ class FlasherConfigPayload(BaseModel):
     config: dict[str, Any] = Field(default_factory=dict)
 
 
+class MasterSyncPayload(BaseModel):
+    target: str = Field(default="both", pattern="^(products|stations|both)$")
+
+
+class MasterItemPayload(BaseModel):
+    code: str = Field(default="", max_length=64)
+    name: str = Field(default="", max_length=200)
+    spec: str = Field(default="", max_length=200)
+    line: str = Field(default="", max_length=200)
+    station_type: str = Field(default="", max_length=200)
+    enabled: bool | None = None
+
+
 def _script(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "id": row["id"],
         "name": row["name"],
         "product_model": row["product_model"],
+        "station_code": row["station_code"] or "",
         "version": row["version"],
         "enabled": bool(row["enabled"]),
         "definition": json.loads(row["definition_json"]),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
+
+
+def _validate_script_binding(definition: dict[str, Any], exclude_id: int | None = None) -> str:
+    """校验脚本绑定：产品/工站必须来自主数据（主数据非空时）；绑定了工站的流程同产品同工站唯一。"""
+    product_model = definition["product_model"]
+    station_code = str(definition.get("station_code", "")).strip()
+    if database.one("SELECT 1 FROM mes_products LIMIT 1"):
+        product = database.one("SELECT enabled FROM mes_products WHERE code = ?", (product_model,))
+        if product is None:
+            raise HTTPException(422, f"产品型号 {product_model} 不在产品主数据中，请先在 MES 页同步或本地添加")
+        if not product["enabled"]:
+            raise HTTPException(422, f"产品 {product_model} 已停用，不能绑定新流程")
+    if station_code and database.one("SELECT 1 FROM mes_stations LIMIT 1"):
+        station = database.one("SELECT enabled FROM mes_stations WHERE code = ?", (station_code,))
+        if station is None:
+            raise HTTPException(422, f"工站 {station_code} 不在工站主数据中，请先在 MES 页同步或本地添加")
+        if not station["enabled"]:
+            raise HTTPException(422, f"工站 {station_code} 已停用，不能绑定新流程")
+    if station_code:
+        conflict = database.one(
+            "SELECT id, name FROM scripts WHERE product_model = ? AND station_code = ? "
+            "AND enabled = 1 AND id != ?",
+            (product_model, station_code, exclude_id or -1),
+        )
+        if conflict:
+            raise HTTPException(
+                409, f"产品 {product_model} 在工站 {station_code} 下已有启用流程「{conflict['name']}」(ID {conflict['id']})"
+            )
+    return station_code
 
 
 def _get_script(script_id: int, enabled_only: bool = True) -> sqlite3.Row:
@@ -263,6 +315,30 @@ def _validate_mes_config(config: dict[str, Any]) -> None:
     timeout = config.get("timeout_seconds", 10)
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 1 <= timeout <= 120:
         raise HTTPException(422, "MES 超时时间必须为 1~120 秒")
+    master = config.get("master_data")
+    if master is None:
+        return
+    if not isinstance(master, dict):
+        raise HTTPException(422, "master_data 必须是 JSON 对象")
+    if str(master.get("mode", "simulator")) not in {"simulator", "http"}:
+        raise HTTPException(422, "master_data.mode 仅支持 simulator 或 http")
+    for entity in ("products", "stations"):
+        entity_config = master.get(entity)
+        if entity_config is None:
+            continue
+        if not isinstance(entity_config, dict):
+            raise HTTPException(422, f"master_data.{entity} 必须是 JSON 对象")
+        url = str(entity_config.get("url", "")).strip()
+        if master.get("mode") == "http" and not url.startswith(("http://", "https://")):
+            raise HTTPException(422, f"master_data.{entity}.url 必须是 HTTP/HTTPS URL")
+        if str(entity_config.get("method", "GET")).upper() not in {"GET", "POST"}:
+            raise HTTPException(422, f"master_data.{entity}.method 仅支持 GET 或 POST")
+        if not isinstance(entity_config.get("headers", {}), dict):
+            raise HTTPException(422, f"master_data.{entity}.headers 必须是 JSON 对象")
+        if not isinstance(entity_config.get("field_map", {}), dict):
+            raise HTTPException(422, f"master_data.{entity}.field_map 必须是 JSON 对象")
+        if not isinstance(entity_config.get("items_path", ""), str):
+            raise HTTPException(422, f"master_data.{entity}.items_path 必须是字符串")
 
 
 @app.get("/api/health")
@@ -306,12 +382,14 @@ def create_script(payload: ScriptPayload) -> dict[str, Any]:
         definition = compile_script(payload.definition)
     except ScriptValidationError as exc:
         raise HTTPException(422, {"message": "脚本校验失败", "errors": exc.errors}) from exc
+    station_code = _validate_script_binding(definition)
     now = utc_now()
     cursor = None
     with database.transaction() as connection:
         cursor = connection.execute(
-            "INSERT INTO scripts(name, product_model, definition_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-            (definition["name"], definition["product_model"], json_dumps(definition), now, now),
+            "INSERT INTO scripts(name, product_model, station_code, definition_json, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (definition["name"], definition["product_model"], station_code, json_dumps(definition), now, now),
         )
         script_id = cursor.lastrowid
     return _script(_get_script(script_id))
@@ -333,12 +411,14 @@ def update_script(script_id: int, payload: ScriptPayload) -> dict[str, Any]:
         definition = compile_script(payload.definition)
     except ScriptValidationError as exc:
         raise HTTPException(422, {"message": "脚本校验失败", "errors": exc.errors}) from exc
+    station_code = _validate_script_binding(definition, exclude_id=script_id)
     database.execute(
-        "UPDATE scripts SET name = ?, product_model = ?, version = version + 1, enabled = 1, "
+        "UPDATE scripts SET name = ?, product_model = ?, station_code = ?, version = version + 1, enabled = 1, "
         "definition_json = ?, updated_at = ? WHERE id = ?",
         (
             definition["name"],
             definition["product_model"],
+            station_code,
             json_dumps(definition),
             utc_now(),
             script_id,
@@ -535,6 +615,88 @@ def preview_mes_payload() -> dict[str, Any]:
         raise HTTPException(422, str(exc)) from exc
 
 
+def _master_error(exc: MESMasterError) -> HTTPException:
+    if isinstance(exc, MESSyncError):
+        return HTTPException(502, str(exc))
+    if isinstance(exc, MESMasterMissingError):
+        return HTTPException(404, str(exc))
+    if isinstance(exc, MESMasterConflictError):
+        return HTTPException(409, str(exc))
+    return HTTPException(422, str(exc))
+
+
+@app.get("/api/mes/products")
+def list_master_products(include_disabled: bool = True) -> dict[str, Any]:
+    return MESMasterData(database).list_items("products", include_disabled)
+
+
+@app.get("/api/mes/stations")
+def list_master_stations(include_disabled: bool = True) -> dict[str, Any]:
+    return MESMasterData(database).list_items("stations", include_disabled)
+
+
+@app.post("/api/mes/sync")
+def sync_master_data(payload: MasterSyncPayload) -> dict[str, Any]:
+    try:
+        return MESMasterData(database).sync(payload.target)
+    except MESMasterError as exc:
+        raise _master_error(exc) from exc
+
+
+@app.post("/api/mes/products", status_code=201)
+def create_master_product(payload: MasterItemPayload) -> dict[str, Any]:
+    try:
+        item = MESMasterData(database).create_item("products", payload.model_dump())
+    except MESMasterError as exc:
+        raise _master_error(exc) from exc
+    return {"message": "本地产品已添加", "item": item}
+
+
+@app.put("/api/mes/products/{code}")
+def update_master_product(code: str, payload: MasterItemPayload) -> dict[str, Any]:
+    try:
+        item = MESMasterData(database).update_item("products", code, payload.model_dump())
+    except MESMasterError as exc:
+        raise _master_error(exc) from exc
+    return {"message": "产品已更新", "item": item}
+
+
+@app.delete("/api/mes/products/{code}")
+def delete_master_product(code: str) -> dict[str, str]:
+    try:
+        MESMasterData(database).delete_item("products", code)
+    except MESMasterError as exc:
+        raise _master_error(exc) from exc
+    return {"message": "本地产品已删除"}
+
+
+@app.post("/api/mes/stations", status_code=201)
+def create_master_station(payload: MasterItemPayload) -> dict[str, Any]:
+    try:
+        item = MESMasterData(database).create_item("stations", payload.model_dump())
+    except MESMasterError as exc:
+        raise _master_error(exc) from exc
+    return {"message": "本地工站已添加", "item": item}
+
+
+@app.put("/api/mes/stations/{code}")
+def update_master_station(code: str, payload: MasterItemPayload) -> dict[str, Any]:
+    try:
+        item = MESMasterData(database).update_item("stations", code, payload.model_dump())
+    except MESMasterError as exc:
+        raise _master_error(exc) from exc
+    return {"message": "工站已更新", "item": item}
+
+
+@app.delete("/api/mes/stations/{code}")
+def delete_master_station(code: str) -> dict[str, str]:
+    try:
+        MESMasterData(database).delete_item("stations", code)
+    except MESMasterError as exc:
+        raise _master_error(exc) from exc
+    return {"message": "本地工站已删除"}
+
+
 @app.post("/api/test-runs/scan")
 def scan_sn(payload: SNPayload) -> dict[str, Any]:
     sn = _validate_sn(payload.sn)
@@ -584,6 +746,9 @@ def start_test(payload: StartPayload, request: Request) -> dict[str, Any]:
     script = _get_script(payload.script_id)
     station = str(database.setting("station_id", DEFAULT_SETTINGS["station_id"]))
     operator = request.state.user["username"]
+    script_station = (script["station_code"] or "").strip()
+    if script_station and script_station != station:
+        raise HTTPException(409, f"该流程绑定工站 {script_station}，与当前工站 {station} 不一致，禁止执行")
     run_id = new_id("run")
     started_at = utc_now()
     definition = json.loads(script["definition_json"])

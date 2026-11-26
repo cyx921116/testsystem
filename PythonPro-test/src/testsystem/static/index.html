@@ -160,8 +160,11 @@
             <article class="card script-editor-card">
               <div class="editor-meta">
                 <div class="field span-2"><label for="draft-name">流程名称</label><input id="draft-name" data-draft-field="name"></div>
-                <div class="field"><label for="draft-model">产品型号</label><input id="draft-model" data-draft-field="product_model"></div>
+                <div class="field"><label for="draft-model">产品型号</label><input id="draft-model" list="product-options" data-draft-field="product_model" placeholder="从 MES 产品主数据选择"></div>
+                <div class="field"><label for="draft-station">绑定工站</label><input id="draft-station" list="station-options" data-draft-field="station_code" placeholder="留空表示不限工站"></div>
                 <div class="version-box"><span>已保存版本</span><strong id="draft-version">未保存</strong></div>
+                <datalist id="product-options"></datalist>
+                <datalist id="station-options"></datalist>
               </div>
               <div class="editor-section-heading"><div><h3>测试步骤</h3><p>拖动画布节点组合逻辑，或切换为步骤列表；保存时统一编译。</p></div><div class="editor-heading-actions"><div class="editor-mode-switch"><button class="active" data-editor-mode="visual">图形画布</button><button data-editor-mode="list">步骤列表</button></div><button class="btn btn-small btn-secondary" id="add-step">+ 添加测试项</button></div></div>
               <div id="validation-results"></div>
@@ -220,6 +223,41 @@
 
         <section class="page" id="page-mes">
           <div class="page-toolbar"><div><h2>MES 数据集成</h2><p>配置 HTTP 接口与字段映射；报告编号作为幂等键，避免重复上传。</p></div><button class="btn btn-primary" id="save-mes">保存全部配置</button></div>
+          <article class="card config-card">
+            <div class="card-header"><div><span class="eyebrow">MASTER DATA</span><h2>产品与工站主数据</h2></div>
+              <div class="toolbar-actions"><span id="master-sync-meta" class="master-meta"></span>
+                <button class="btn btn-small btn-secondary" id="sync-products">同步产品</button>
+                <button class="btn btn-small btn-secondary" id="sync-stations">同步工站</button>
+                <button class="btn btn-small btn-primary" id="sync-master">全部同步</button>
+              </div>
+            </div>
+            <div class="master-grid">
+              <section class="master-panel">
+                <div class="master-panel-head"><h3>产品</h3><span id="master-products-count" class="count-badge">0</span></div>
+                <div class="table-wrap"><table class="data-table"><thead><tr><th>编号</th><th>名称</th><th>规格</th><th>来源</th><th>状态</th><th>操作</th></tr></thead><tbody id="master-products"></tbody></table></div>
+                <form id="master-product-form" class="master-form" data-entity="products">
+                  <input id="mp-code" placeholder="编号" required>
+                  <input id="mp-name" placeholder="名称" required>
+                  <input id="mp-spec" placeholder="规格（可选）">
+                  <button class="btn btn-small btn-primary" type="submit">添加本地产品</button>
+                  <button class="btn btn-small btn-ghost" type="button" id="mp-cancel" hidden>取消编辑</button>
+                </form>
+              </section>
+              <section class="master-panel">
+                <div class="master-panel-head"><h3>工站</h3><span id="master-stations-count" class="count-badge">0</span></div>
+                <div class="table-wrap"><table class="data-table"><thead><tr><th>编号</th><th>名称</th><th>产线</th><th>类型</th><th>来源</th><th>状态</th><th>操作</th></tr></thead><tbody id="master-stations"></tbody></table></div>
+                <form id="master-station-form" class="master-form" data-entity="stations">
+                  <input id="ms-code" placeholder="编号" required>
+                  <input id="ms-name" placeholder="名称" required>
+                  <input id="ms-line" placeholder="产线（可选）">
+                  <input id="ms-type" placeholder="类型（可选）">
+                  <button class="btn btn-small btn-primary" type="submit">添加本地工站</button>
+                  <button class="btn btn-small btn-ghost" type="button" id="ms-cancel" hidden>取消编辑</button>
+                </form>
+              </section>
+            </div>
+            <p class="master-hint">「同步」从 MES 拉取产品与工站（模拟器模式使用内置示例数据）；本地添加的数据不受同步影响，同编号时以 MES 为准。</p>
+          </article>
           <div class="mes-layout">
             <article class="card config-card">
               <div class="card-header"><div><span class="eyebrow">HTTP ENDPOINT</span><h2>接口配置</h2></div></div>
@@ -234,8 +272,18 @@
               </div>
             </article>
             <div class="stacked-cards">
+              <article class="card config-card"><div class="card-header"><div><span class="eyebrow">MASTER DATA SOURCE</span><h2>主数据接口</h2></div></div><div class="config-grid single">
+                <div class="field"><label for="mes-master-mode">数据来源</label><select id="mes-master-mode"><option value="simulator">模拟器（内置示例数据）</option><option value="http">HTTP 接口</option></select></div>
+                <div class="field"><label for="mes-master-products-url">产品查询地址</label><input id="mes-master-products-url" placeholder="https://mes.example.com/api/products"></div>
+                <div class="field"><label for="mes-master-products-path">产品列表路径</label><input id="mes-master-products-path" class="mono" placeholder="data.list"></div>
+                <div class="field"><label for="mes-master-products-map">产品字段映射（JSON）</label><textarea id="mes-master-products-map" class="code-input" rows="3" spellcheck="false"></textarea><small>把 MES 返回的字段映射到 编号/名称/规格，例如 {"code": "itemCode", "name": "itemName"}</small></div>
+                <div class="field"><label for="mes-master-stations-url">工站查询地址</label><input id="mes-master-stations-url" placeholder="https://mes.example.com/api/stations"></div>
+                <div class="field"><label for="mes-master-stations-path">工站列表路径</label><input id="mes-master-stations-path" class="mono" placeholder="data.list"></div>
+                <div class="field"><label for="mes-master-stations-map">工站字段映射（JSON）</label><textarea id="mes-master-stations-map" class="code-input" rows="3" spellcheck="false"></textarea><small>把 MES 返回的字段映射到 编号/名称/产线/类型，例如 {"code": "stationCode", "name": "stationName"}</small></div>
+                <small>HTTP 模式下地址、列表路径和字段映射必填；模拟器模式无需填写。查询方法默认 GET，可在完整 MES 配置 JSON 中调整。</small>
+              </div></article>
               <article class="card config-card"><div class="card-header"><div><span class="eyebrow">STATION POLICY</span><h2>工位策略</h2></div></div><div class="config-grid single">
-                <div class="field"><label for="setting-station">工位编号</label><input id="setting-station"></div>
+                <div class="field"><label for="setting-station">工位编号</label><input id="setting-station" list="station-options" placeholder="从工站主数据选择，如 STATION-01"></div>
                 <div class="field"><label for="setting-operator">默认操作员</label><input id="setting-operator"></div>
                 <div class="field"><label for="setting-sn-pattern">SN 正则校验规则</label><input id="setting-sn-pattern" class="mono"></div>
                 <div class="field"><label for="setting-max-retests">失败复测次数上限（0-20）</label><input id="setting-max-retests" type="number" min="0" max="20" step="1"><small>测试失败的 SN 允许复测的次数；0 表示失败后禁止复测，已合格的 SN 始终禁止重复测试</small></div>

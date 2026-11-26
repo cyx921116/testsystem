@@ -22,6 +22,7 @@ const state = {
   flasherConfig: {},
   mesConfig: {},
   settings: {},
+  master: { products: [], stations: [], productsSync: null, stationsSync: null, mode: "simulator" },
   reports: [],
   editorMode: "visual",
   selectedStep: 0,
@@ -152,7 +153,7 @@ function navigate(page) {
   if (page === "scripts") { renderScriptLibrary(); loadFirmware(); }
   if (page === "protocols") loadProtocols();
   if (page === "firmware") loadFirmware();
-  if (page === "mes") loadMesSettings();
+  if (page === "mes") { loadMesSettings(); loadMasterData(); }
   if (page === "reports") loadReports();
   if (page === "users") loadUsers();
 }
@@ -180,10 +181,11 @@ async function loadDashboard() {
 
 async function loadScripts() {
   state.scripts = await api("/api/scripts");
-  const enabled = state.scripts.filter((script) => script.enabled);
+  const station = state.settings?.station_id || "";
+  const enabled = state.scripts.filter((script) => script.enabled && (!script.station_code || !station || script.station_code === station));
   if (!enabled.some((script) => script.id === state.selectedScriptId)) state.selectedScriptId = enabled[0]?.id || null;
   $("#production-script").innerHTML = enabled.map((script) => `
-    <option value="${script.id}" ${script.id === state.selectedScriptId ? "selected" : ""}>${escapeHtml(script.product_model)} · ${escapeHtml(script.name)} · v${script.version}</option>`).join("");
+    <option value="${script.id}" ${script.id === state.selectedScriptId ? "selected" : ""}>${escapeHtml(script.product_model)} · ${escapeHtml(script.name)} · v${script.version}${script.station_code ? ` · ${escapeHtml(script.station_code)}` : ""}</option>`).join("");
 }
 
 function currentProductionScript() {
@@ -635,21 +637,23 @@ function renderScriptLibrary() {
   $("#script-count").textContent = state.scripts.length;
   $("#script-list").innerHTML = state.scripts.map((script) => `
     <button class="script-list-item ${script.id === state.draftId ? "active" : ""} ${script.enabled ? "" : "disabled"}" data-script-select="${script.id}">
-      <strong>${escapeHtml(script.name)}</strong><span>${escapeHtml(script.product_model)} · ${script.definition.steps.length} 个测试项</span><small>VERSION ${script.version}${script.enabled ? "" : " · 已停用"}</small>
+      <strong>${escapeHtml(script.name)}</strong><span>${escapeHtml(script.product_model)}${script.station_code ? ` · ${escapeHtml(script.station_code)}` : " · 不限工站"} · ${script.definition.steps.length} 个测试项</span><small>VERSION ${script.version}${script.enabled ? "" : " · 已停用"}</small>
     </button>`).join("") || '<div class="empty-row">暂无流程，请新建</div>';
-  if (!state.draft) state.draft = { schema_version: 1, name: "新产品测试流程", product_model: "NEW-MODEL", variables: {}, steps: [newStep()] };
+  if (!state.draft) state.draft = { schema_version: 1, name: "新产品测试流程", product_model: "NEW-MODEL", station_code: "", variables: {}, steps: [newStep()] };
   $("#draft-name").value = state.draft.name || "";
   $("#draft-model").value = state.draft.product_model || "";
+  $("#draft-station").value = state.draft.station_code || "";
   $("#draft-version").textContent = state.draftVersion ? `v${state.draftVersion}` : "未保存";
   $("#validation-results").innerHTML = "";
   $("#script-json").value = JSON.stringify(state.draft, null, 2);
+  renderMasterDatalists();
   renderSteps();
 }
 
 function createNewScript() {
   state.draftId = null;
   state.draftVersion = null;
-  state.draft = { schema_version: 1, name: "新产品测试流程", product_model: "NEW-MODEL", variables: {}, steps: [newStep()] };
+  state.draft = { schema_version: 1, name: "新产品测试流程", product_model: "NEW-MODEL", station_code: "", variables: {}, steps: [newStep()] };
   state.selectedStep = 0;
   state.selectedAction = null;
   renderScriptLibrary();
@@ -856,7 +860,7 @@ function bindScriptEditor() {
     const button = event.target.closest("[data-script-select]");
     if (button) openScript(button.dataset.scriptSelect);
   });
-  [$("#draft-name"), $("#draft-model")].forEach((input) => input.addEventListener("input", () => {
+  [$("#draft-name"), $("#draft-model"), $("#draft-station")].forEach((input) => input.addEventListener("input", () => {
     state.draft[input.dataset.draftField] = input.value;
   }));
   [$("#steps-container"), $("#node-inspector")].filter(Boolean).forEach((container) => {
@@ -878,6 +882,7 @@ function bindScriptEditor() {
       state.selectedAction = null;
       $("#draft-name").value = state.draft.name || "";
       $("#draft-model").value = state.draft.product_model || "";
+      $("#draft-station").value = state.draft.station_code || "";
       renderSteps();
       toast("JSON 已应用，请执行编译校验", "success");
     } catch (error) { toast(error.message, "error"); }
@@ -1116,12 +1121,23 @@ async function loadMesSettings() {
     $("#mes-idempotency").value = config.idempotency_header || "Idempotency-Key";
     $("#mes-payload-mode").value = config.payload_mode || "mapped";
     $("#mes-mapping").value = JSON.stringify(config.payload_mapping || {}, null, 2);
+    const master = config.master_data || {};
+    $("#mes-master-mode").value = master.mode || "simulator";
+    const products = master.products || {};
+    $("#mes-master-products-url").value = products.url || "";
+    $("#mes-master-products-path").value = products.items_path || "";
+    $("#mes-master-products-map").value = JSON.stringify(products.field_map || {}, null, 2);
+    const stations = master.stations || {};
+    $("#mes-master-stations-url").value = stations.url || "";
+    $("#mes-master-stations-path").value = stations.items_path || "";
+    $("#mes-master-stations-map").value = JSON.stringify(stations.field_map || {}, null, 2);
   } catch (error) { toast(error.message, "error"); }
 }
 
 async function saveMesSettings(showToast = true) {
   const headers = parseJsonField($("#mes-headers").value, "请求头");
   const mapping = parseJsonField($("#mes-mapping").value, "字段映射");
+  const previousMaster = state.mesConfig.master_data || {};
   const config = {
     ...state.mesConfig,
     endpoint: $("#mes-endpoint").value.trim(),
@@ -1131,6 +1147,21 @@ async function saveMesSettings(showToast = true) {
     idempotency_header: $("#mes-idempotency").value.trim(),
     payload_mode: $("#mes-payload-mode").value,
     payload_mapping: mapping,
+    master_data: {
+      mode: $("#mes-master-mode").value,
+      products: {
+        ...(previousMaster.products || {}),
+        url: $("#mes-master-products-url").value.trim(),
+        items_path: $("#mes-master-products-path").value.trim(),
+        field_map: parseJsonField($("#mes-master-products-map").value || "{}", "产品字段映射"),
+      },
+      stations: {
+        ...(previousMaster.stations || {}),
+        url: $("#mes-master-stations-url").value.trim(),
+        items_path: $("#mes-master-stations-path").value.trim(),
+        field_map: parseJsonField($("#mes-master-stations-map").value || "{}", "工站字段映射"),
+      },
+    },
   };
   const settings = {
     station_id: $("#setting-station").value.trim(),
@@ -1155,6 +1186,131 @@ async function previewMes() {
     const payload = await api("/api/mes/preview");
     $("#mes-preview").textContent = JSON.stringify(payload, null, 2);
     toast("报文预览已生成，未调用 MES", "success");
+  } catch (error) { toast(error.message, "error"); }
+}
+
+const masterEntityMeta = {
+  products: { tbody: "#master-products", count: "#master-products-count", form: "#master-product-form", fields: [["code", "#mp-code"], ["name", "#mp-name"], ["spec", "#mp-spec"]], cancel: "#mp-cancel", label: "产品" },
+  stations: { tbody: "#master-stations", count: "#master-stations-count", form: "#master-station-form", fields: [["code", "#ms-code"], ["name", "#ms-name"], ["line", "#ms-line"], ["station_type", "#ms-type"]], cancel: "#ms-cancel", label: "工站" },
+};
+
+async function loadMasterData() {
+  try {
+    const [products, stations] = await Promise.all([api("/api/mes/products"), api("/api/mes/stations")]);
+    state.master.products = products.items;
+    state.master.stations = stations.items;
+    state.master.productsSync = products.last_sync;
+    state.master.stationsSync = stations.last_sync;
+    state.master.mode = products.mode || "simulator";
+    renderMasterTables();
+    renderMasterDatalists();
+  } catch (error) { toast(error.message, "error"); }
+}
+
+function renderMasterMeta() {
+  const modeText = state.master.mode === "simulator" ? "模拟器" : "HTTP 接口";
+  const format = (value) => (value ? formatTime(value) : "未同步");
+  $("#master-sync-meta").textContent = `来源：${modeText} · 产品 ${format(state.master.productsSync)} · 工站 ${format(state.master.stationsSync)}`;
+}
+
+function renderMasterTables() {
+  renderMasterMeta();
+  for (const [entity, meta] of Object.entries(masterEntityMeta)) {
+    const items = state.master[entity];
+    $(meta.count).textContent = items.length;
+    const columns = entity === "products"
+      ? (item) => `<td>${escapeHtml(item.spec || "—")}</td>`
+      : (item) => `<td>${escapeHtml(item.line || "—")}</td><td>${escapeHtml(item.station_type || "—")}</td>`;
+    $(meta.tbody).innerHTML = items.map((item) => `
+      <tr>
+        <td><span class="sn-primary">${escapeHtml(item.code)}</span></td>
+        <td>${escapeHtml(item.name)}</td>
+        ${columns(item)}
+        <td>${item.source === "mes" ? "MES" : "本地"}</td>
+        <td><span class="badge ${item.enabled ? "badge-pass" : "badge-fail"}">${item.enabled ? "启用" : "停用"}</span></td>
+        <td><div class="table-actions">
+          ${item.source === "local" ? `<button class="btn btn-small btn-secondary" data-master-action="edit" data-entity="${entity}" data-code="${escapeHtml(item.code)}">编辑</button>` : ""}
+          <button class="btn btn-small btn-secondary" data-master-action="toggle" data-entity="${entity}" data-code="${escapeHtml(item.code)}">${item.enabled ? "停用" : "启用"}</button>
+          ${item.source === "local" ? `<button class="btn btn-small btn-ghost danger-text" data-master-action="delete" data-entity="${entity}" data-code="${escapeHtml(item.code)}">删除</button>` : ""}
+        </div></td>
+      </tr>`).join("") || '<tr><td colspan="7" class="empty-row">暂无数据，点击右上角“同步”从 MES 拉取，或在下方添加本地数据</td></tr>';
+  }
+}
+
+function renderMasterDatalists() {
+  $("#product-options").innerHTML = state.master.products.filter((item) => item.enabled)
+    .map((item) => `<option value="${escapeHtml(item.code)}">${escapeHtml(item.name)}</option>`).join("");
+  $("#station-options").innerHTML = state.master.stations.filter((item) => item.enabled)
+    .map((item) => `<option value="${escapeHtml(item.code)}">${escapeHtml(item.name)}</option>`).join("");
+}
+
+async function syncMaster(target) {
+  try {
+    const result = await api("/api/mes/sync", { method: "POST", body: { target } });
+    const summary = Object.entries(result).map(([entity, stats]) =>
+      `${masterEntityMeta[entity]?.label || entity}：新增 ${stats.added}、更新 ${stats.updated}、停用 ${stats.disabled}`).join("；");
+    toast(`同步完成（${summary}）`, "success");
+    await loadMasterData();
+    await loadScripts();
+  } catch (error) { toast(error.message, "error"); }
+}
+
+function resetMasterForm(entity) {
+  const meta = masterEntityMeta[entity];
+  meta.fields.forEach(([, selector]) => { $(selector).value = ""; $(selector).disabled = false; });
+  $(meta.form).dataset.editCode = "";
+  $(meta.form).querySelector("button[type=submit]").textContent = `添加本地${meta.label}`;
+  $(meta.cancel).hidden = true;
+}
+
+function editMasterItem(entity, code) {
+  const item = state.master[entity].find((entry) => entry.code === code);
+  if (!item) return;
+  const meta = masterEntityMeta[entity];
+  meta.fields.forEach(([field, selector]) => { $(selector).value = item[field] || ""; });
+  $(meta.fields[0][1]).disabled = true;
+  $(meta.form).dataset.editCode = code;
+  $(meta.form).querySelector("button[type=submit]").textContent = `保存${meta.label}`;
+  $(meta.cancel).hidden = false;
+  $(meta.fields[1][1]).focus();
+}
+
+async function submitMasterForm(form) {
+  const entity = form.dataset.entity;
+  const meta = masterEntityMeta[entity];
+  const data = {};
+  meta.fields.forEach(([field, selector]) => { data[field] = $(selector).value.trim(); });
+  const editCode = form.dataset.editCode;
+  try {
+    if (editCode) {
+      await api(`/api/mes/${entity}/${encodeURIComponent(editCode)}`, { method: "PUT", body: { ...data, enabled: true } });
+      toast(`${meta.label}已更新`, "success");
+    } else {
+      await api(`/api/mes/${entity}`, { method: "POST", body: data });
+      toast(`本地${meta.label}已添加`, "success");
+    }
+    resetMasterForm(entity);
+    await loadMasterData();
+  } catch (error) { toast(error.message, "error"); }
+}
+
+async function toggleMasterItem(entity, code) {
+  const item = state.master[entity].find((entry) => entry.code === code);
+  if (!item) return;
+  try {
+    await api(`/api/mes/${entity}/${encodeURIComponent(code)}`, { method: "PUT", body: { enabled: !item.enabled } });
+    await loadMasterData();
+    toast(`${code} 已${item.enabled ? "停用" : "启用"}`, "success");
+  } catch (error) { toast(error.message, "error"); }
+}
+
+async function deleteMasterItem(entity, code) {
+  const meta = masterEntityMeta[entity];
+  if (!window.confirm(`确认删除本地${meta.label} ${code}？`)) return;
+  try {
+    await api(`/api/mes/${entity}/${encodeURIComponent(code)}`, { method: "DELETE" });
+    toast(`本地${meta.label}已删除`, "success");
+    await loadMasterData();
   } catch (error) { toast(error.message, "error"); }
 }
 
@@ -1412,6 +1568,17 @@ function bindEvents() {
     try { await saveMesSettings(); } catch (error) { toast(error.message, "error"); }
   });
   $("#preview-mes").addEventListener("click", previewMes);
+  $("#sync-products").addEventListener("click", () => syncMaster("products"));
+  $("#sync-stations").addEventListener("click", () => syncMaster("stations"));
+  $("#sync-master").addEventListener("click", () => syncMaster("both"));
+  ["products", "stations"].forEach((entity) => {
+    const meta = masterEntityMeta[entity];
+    $(meta.form).addEventListener("submit", (event) => {
+      event.preventDefault();
+      submitMasterForm(event.target);
+    });
+    $(meta.cancel).addEventListener("click", () => resetMasterForm(entity));
+  });
   bindScriptEditor();
   document.addEventListener("click", (event) => {
     const navigateButton = event.target.closest("[data-navigate]");
@@ -1428,6 +1595,13 @@ function bindEvents() {
     if (resetUserButton) resetUserPassword(resetUserButton);
     const verifyFirmwareButton = event.target.closest("[data-verify-firmware]");
     if (verifyFirmwareButton) verifyFirmware(verifyFirmwareButton);
+    const masterButton = event.target.closest("[data-master-action]");
+    if (masterButton) {
+      const { masterAction, entity, code } = masterButton.dataset;
+      if (masterAction === "edit") editMasterItem(entity, code);
+      else if (masterAction === "toggle") toggleMasterItem(entity, code);
+      else if (masterAction === "delete") deleteMasterItem(entity, code);
+    }
     if (event.target.closest("[data-close-modal]")) closeReport();
     if (event.target.closest("[data-print-report]")) window.print();
   });

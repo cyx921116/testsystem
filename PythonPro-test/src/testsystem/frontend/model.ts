@@ -52,6 +52,7 @@ export function emptyDefinition(): FlowDefinition {
     schema_version: 2,
     name: "新产品控制流程",
     product_model: "NEW-MODEL",
+    station_code: "",
     variables: {},
     steps: [createNode("test")],
     subflows: {},

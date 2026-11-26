@@ -51,6 +51,7 @@ export interface FlowDefinition {
   schema_version: number;
   name: string;
   product_model: string;
+  station_code?: string;
   variables: Record<string, unknown>;
   steps: FlowNode[];
   subflows: Record<string, SubflowDefinition>;

@@ -33,6 +33,7 @@ ASSERT_OPERATORS = {
 }
 ID_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,39}$")
 VARIABLE_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+STATION_CODE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
 class ScriptValidationError(ValueError):
@@ -197,6 +198,9 @@ def compile_script(source: dict[str, Any]) -> dict[str, Any]:
         errors.append("脚本名称不能为空")
     if not str(script.get("product_model", "")).strip():
         errors.append("产品型号不能为空")
+    station_code = str(script.get("station_code", "")).strip()
+    if station_code and not STATION_CODE_PATTERN.fullmatch(station_code):
+        errors.append("station_code 仅允许字母、数字、点、下划线、连字符，且以字母或数字开头")
     if not isinstance(script.get("variables", {}), dict):
         errors.append("variables 必须是 JSON 对象")
     steps = script.get("steps")
@@ -242,6 +246,7 @@ def compile_script(source: dict[str, Any]) -> dict[str, Any]:
     script["schema_version"] = 1
     script["name"] = str(script["name"]).strip()
     script["product_model"] = str(script["product_model"]).strip()
+    script["station_code"] = station_code
     script.setdefault("variables", {})
     for step in script["steps"]:
         step.setdefault("timeout_ms", 5000)

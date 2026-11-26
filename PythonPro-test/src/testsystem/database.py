@@ -24,9 +24,35 @@ CREATE TABLE IF NOT EXISTS scripts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
     product_model TEXT NOT NULL,
+    station_code TEXT NOT NULL DEFAULT '',
     version INTEGER NOT NULL DEFAULT 1,
     enabled INTEGER NOT NULL DEFAULT 1,
     definition_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS mes_products (
+    code TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    spec TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT 'local' CHECK(source IN ('mes', 'local')),
+    enabled INTEGER NOT NULL DEFAULT 1,
+    raw_json TEXT NOT NULL DEFAULT '{}',
+    synced_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS mes_stations (
+    code TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    line TEXT NOT NULL DEFAULT '',
+    station_type TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT 'local' CHECK(source IN ('mes', 'local')),
+    enabled INTEGER NOT NULL DEFAULT 1,
+    raw_json TEXT NOT NULL DEFAULT '{}',
+    synced_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -192,6 +218,30 @@ DEFAULT_MES_CONFIG = {
         "idempotencyKey": "${report_no}",
         "data": "${report}",
     },
+    "master_data": {
+        "mode": "simulator",
+        "products": {
+            "url": "",
+            "method": "GET",
+            "headers": {},
+            "items_path": "data.list",
+            "field_map": {"code": "itemCode", "name": "itemName", "spec": "specification"},
+            "enabled": True,
+        },
+        "stations": {
+            "url": "",
+            "method": "GET",
+            "headers": {},
+            "items_path": "data.list",
+            "field_map": {
+                "code": "stationCode",
+                "name": "stationName",
+                "line": "lineCode",
+                "station_type": "stationType",
+            },
+            "enabled": True,
+        },
+    },
 }
 
 DEFAULT_SETTINGS = {
@@ -246,6 +296,11 @@ class Database:
             connection.execute(
                 "UPDATE test_items SET node_id = COALESCE(node_id, item_id), path = COALESCE(path, item_id)"
             )
+            script_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(scripts)").fetchall()
+            }
+            if "station_code" not in script_columns:
+                connection.execute("ALTER TABLE scripts ADD COLUMN station_code TEXT NOT NULL DEFAULT ''")
             now = utc_now()
             for name, config in DEFAULT_PROTOCOL_CONFIGS.items():
                 connection.execute(
@@ -266,6 +321,21 @@ class Database:
                 connection.execute(
                     "INSERT OR IGNORE INTO settings(key, value_json, updated_at) VALUES (?, ?, ?)",
                     (key, json_dumps(value), now),
+                )
+            stored_mes = json.loads(
+                connection.execute("SELECT value_json FROM settings WHERE key = 'mes'").fetchone()["value_json"]
+            )
+            merged_mes = {**DEFAULT_MES_CONFIG, **stored_mes}
+            stored_master = stored_mes.get("master_data") if isinstance(stored_mes.get("master_data"), dict) else {}
+            merged_master = {**DEFAULT_MES_CONFIG["master_data"], **stored_master}
+            for entity in ("products", "stations"):
+                stored_entity = stored_master.get(entity) if isinstance(stored_master.get(entity), dict) else {}
+                merged_master[entity] = {**DEFAULT_MES_CONFIG["master_data"][entity], **stored_entity}
+            merged_mes["master_data"] = merged_master
+            if merged_mes != stored_mes:
+                connection.execute(
+                    "UPDATE settings SET value_json = ?, updated_at = ? WHERE key = 'mes'",
+                    (json_dumps(merged_mes), now),
                 )
             if connection.execute("SELECT COUNT(*) FROM scripts").fetchone()[0] == 0:
                 definition = compile_script(DEFAULT_SCRIPT)

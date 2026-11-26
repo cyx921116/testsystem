@@ -101,6 +101,7 @@ Testsystem/
         ├── control_flow.py    v2 递归执行、并行、循环和控制事件
         ├── flasher.py         固件烧录框架：固件仓、烧录后端与记录
         ├── mes.py             MES 报文构造、HTTP 上传、上传日志
+        ├── mes_master.py      MES 主数据同步（产品/工站）与本地维护
         ├── protocols.py       各通讯协议适配器
         ├── protocol_definitions.py 协议字段元数据和默认连接参数
         ├── utils.py           时间、ID、JSON、模板变量工具
@@ -252,7 +253,8 @@ uv build
 | --- | --- |
 | `id` | 自增脚本 ID |
 | `name` | 脚本名称 |
-| `product_model` | 对应产品型号 |
+| `product_model` | 对应产品型号，引用 `mes_products.code`（主数据非空时必须是已启用产品） |
+| `station_code` | 绑定的工站编号，引用 `mes_stations.code`；空串表示不限工站，绑定了工站的流程同产品同工站只能有一个启用版本 |
 | `version` | 每次保存自动加 1 |
 | `enabled` | 1 可用，0 停用 |
 | `definition_json` | 编译规范化后的完整 JSON |
@@ -279,12 +281,28 @@ uv build
 - `sn_pattern`：SN 正则表达式。
 - `auto_upload`：报告生成后是否自动上传 MES。
 - `max_retests`：失败复测次数上限，默认 3；0 表示失败后禁止复测。已合格的 SN 始终禁止重复测试。
-- `mes`：MES 地址、方法、请求头、报文映射等完整 JSON。
+- `mes`：MES 地址、方法、请求头、报文映射等完整 JSON，另含 `master_data` 主数据段（模式、产品/工站查询地址、列表路径、字段映射，见 `DEFAULT_MES_CONFIG`）。
 - `auth_secret`：仅用于签名登录 Cookie 的本地随机密钥，不通过工位设置 API 返回。
 
 ### 6.4.1 `users`：登录账号与角色
 
 保存用户名、显示名称、`admin/operator` 角色、随机盐、PBKDF2-HMAC-SHA256 密码哈希、启用状态和会话版本。修改或重置密码、启停账号会递增会话版本，使旧 Cookie 失效。默认账号只在首次初始化时创建，重启不会重置密码。数据库中不保存明文密码。
+
+### 6.4.2 `mes_products` / `mes_stations`：产品与工站主数据
+
+MES 是产品型号和工站编号的权威来源，测试系统本地缓存这两张表，断网也能扫码和执行：
+
+| 字段 | 含义 |
+| --- | --- |
+| `code` | 产品型号 / 工站编号，主键 |
+| `name` | 显示名称 |
+| `spec` / `line` + `station_type` | 产品规格；工站所属产线与类型 |
+| `source` | `mes`（同步而来）或 `local`（本地添加） |
+| `enabled` | 1 启用，0 停用；同步时 MES 中消失的数据自动置 0，不物理删除 |
+| `raw_json` | 同步时的原始报文，便于追溯映射问题 |
+| `synced_at` | 最近一次由同步写入的时间 |
+
+同步规则：以 MES 返回为准按 `code` upsert，`source='mes'`；本地添加的行（`source='local'`）同步时不受任何影响；同编号冲突时以 MES 数据覆盖。本地行可编辑、删除；MES 行只能启用/停用，不能本地删除或改名称。主数据为空时，脚本产品型号和工站保持原有自由文本模式，便于 demo 和离线使用。
 
 ### 6.5 `test_runs`：一次测试运行
 
@@ -384,6 +402,8 @@ report_no TEXT NOT NULL UNIQUE
 ```text
 products 1 ──────── N test_runs
 scripts  1 ──────── N test_runs
+mes_products 1 ──── 0..N scripts（product_model 引用，非外键）
+mes_stations 1 ──── 0..N scripts（station_code 引用，空串表示未绑定）
 test_runs 1 ─────── N test_items
 test_runs 1 ─────── N control_events
 test_runs 1 ─────── N flash_records
@@ -979,8 +999,14 @@ Pydantic 在业务函数之前拒绝缺失或类型明显错误的请求。
 | GET | `/api/settings` | 读取工位策略 |
 | PUT | `/api/settings` | 校验 SN 正则并保存工位策略 |
 | GET | `/api/mes/config` | 读取 MES 配置 |
-| PUT | `/api/mes/config` | 校验并保存 MES 配置 |
+| PUT | `/api/mes/config` | 校验并保存 MES 配置（含 `master_data` 主数据段） |
 | GET | `/api/mes/preview` | 用最新报告或示例报告生成预览，不发送网络请求 |
+| GET | `/api/mes/products` | 产品主数据列表（操作工只读，管理员可 `?include_disabled=0` 只看启用） |
+| GET | `/api/mes/stations` | 工站主数据列表（操作工只读） |
+| POST | `/api/mes/sync` | 手动同步主数据，body `{"target": "products"&#124;"stations"&#124;"both"}`；MES 端失败返回 502 |
+| POST | `/api/mes/products` / `/api/mes/stations` | 添加本地产品/工站（管理员） |
+| PUT | `/api/mes/products/{code}` / `/api/mes/stations/{code}` | 更新本地数据；MES 同步数据仅支持启用/停用（管理员） |
+| DELETE | `/api/mes/products/{code}` / `/api/mes/stations/{code}` | 删除本地数据；MES 同步数据返回 409（管理员） |
 
 ### 生产执行 API
 
@@ -994,7 +1020,7 @@ Pydantic 在业务函数之前拒绝缺失或类型明显错误的请求。
 
 `POST /api/test-runs` → `start_test()`：
 
-1. 再次校验 SN、脚本、工位和操作员。
+1. 再次校验 SN、脚本、工位和操作员；脚本绑定的工站与当前工位不一致时返回 409。
 2. 在一个 `BEGIN IMMEDIATE` 事务中检查正式报告（合格禁止、复测超限 409）和工位占用。
 3. 检查 `products` 是否已有扫码记录，没有则拒绝，防止 API 绕过扫码。
 4. 创建 RUNNING 运行和脚本快照。
@@ -1031,6 +1057,43 @@ Pydantic 在业务函数之前拒绝缺失或类型明显错误的请求。
 - `ExternalToolFlasher`：通过命令模板调用外部 CLI 烧录工具（如 STM32_Programmer_CLI），支持超时、返回码和输出关键字判定。
 - `build_flash_record()`：生成“哪个 SN 烧了什么固件”的可追溯记录，供后续 `flash_records` 表持久化。
 - `create_flasher()` / `flasher_catalog()`：后端工厂与目录，风格同 `create_protocol()` / `protocol_catalog()`。
+
+## 7.11 `mes_master.py`：MES 主数据同步与本地维护
+
+负责把 MES 的产品、工站主数据同步到本地缓存表，并支持本地两端维护（MES 端 + 本地端）。
+
+### 异常分层
+
+- `MESMasterError`：配置或本地维护错误，API 映射为 422。
+- `MESMasterConflictError`：编号冲突、删除 MES 同步数据等冲突，映射为 409。
+- `MESMasterMissingError`：编号不存在，映射为 404。
+- `MESSyncError`：MES 端 HTTP / 网络错误，映射为 502，与报告上传的 `MESUploadError` 一致。
+
+### 模拟器数据源
+
+`SIMULATOR_PRODUCTS` / `SIMULATOR_STATIONS` 在未接入真实 MES 时提供示例数据（含默认脚本使用的 `DEMO-100` 和默认工位 `STATION-01`），字段与 HTTP 模式映射后的目标字段一致，便于无 MES 环境验证完整流程。
+
+### `MESMasterData.sync(target)`
+
+`target` 为 `products` / `stations` / `both`。按实体读取 `settings.mes.master_data` 配置：
+
+- `mode = simulator`：直接使用模拟器数据。
+- `mode = http`：`GET`/`POST` 查询地址，按 `items_path` 从响应 JSON 中取列表，再按 `field_map` 把 MES 字段映射到 `code`/`name`/`spec`（工站另含 `line`/`station_type`），`field_map` 复用 `resolve_path()` 支持嵌套路径。
+
+同步在单事务中按 `code` upsert：`source='mes'`、置为启用、写 `raw_json` 和 `synced_at`；上次同步存在而本次响应缺失的 MES 行置为停用（保留追溯）；`source='local'` 行完全不受影响。返回 `{total, added, updated, disabled, synced_at}`。
+
+### 本地维护
+
+`list_items()` / `get_item()` 供查询接口使用；`create_item()` / `update_item()` / `delete_item()` 只作用于 `source='local'` 的行（MES 行仅允许启用/停用、禁止删除，删除会抛 `MESMasterConflictError`）。所有 SQL 字段名来自 `ENTITY_FIELDS` 白名单常量，不拼接用户输入。
+
+## 7.12 脚本绑定校验
+
+`_validate_script_binding(definition, exclude_id)` 在脚本创建和更新时执行：
+
+1. 主数据非空时，`product_model` 必须是 `mes_products` 中已启用的产品；`station_code` 非空时必须是 `mes_stations` 中已启用的工站；主数据为空则保持自由文本（demo / 离线兼容）。
+2. 绑定了工站的流程，同产品同工站只允许一个启用版本（409）；未绑工站的流程保持原有自由模式，允许同产品多个启用流程。
+
+`start_test()` 启动前额外校验：脚本绑定的 `station_code` 与当前工位 `settings.station_id` 不一致时返回 409，防止在错误工站执行流程。
 
 ## 8. 前端详细说明
 
@@ -1080,7 +1143,7 @@ Pydantic 在业务函数之前拒绝缺失或类型明显错误的请求。
 
 ### MES 页 `#page-mes`
 
-包含地址、方法、超时、请求头、幂等头、报文模式、字段映射，以及工位号、默认操作员、SN 正则和自动上传。`#mes-preview` 只展示本地预览。
+顶部是「产品与工站主数据」卡片：`#sync-products` / `#sync-stations` / `#sync-master` 手动触发同步并显示统计，`#master-products` / `#master-stations` 两个表格展示编号、名称、来源（MES/本地）、启用状态和操作，表格下方表单支持本地添加与编辑（编辑时编号锁定，MES 同步数据只能启停、不能删除或改名）。接口配置卡片下方是「主数据接口」：数据来源（模拟器/HTTP）、产品与工站的查询地址、列表路径和字段映射 JSON。其余包含地址、方法、超时、请求头、幂等头、报文模式、字段映射，以及工位号（带工站主数据下拉）、默认操作员、SN 正则和自动上传。`#mes-preview` 只展示本地预览。
 
 ### 报告中心 `#page-reports`
 
@@ -1125,6 +1188,7 @@ Pydantic 在业务函数之前拒绝缺失或类型明显错误的请求。
 | `pollTimer` | 运行轮询定时器 |
 | `protocols` / `selectedProtocol` | 协议目录和选中项 |
 | `mesConfig` / `settings` | MES 与工位配置 |
+| `master` | 产品/工站主数据缓存与同步状态（`products`、`stations`、`productsSync`、`stationsSync`、`mode`） |
 | `reports` | 报告中心当前查询结果 |
 
 ## 8.4 前端通用函数
@@ -1383,6 +1447,7 @@ PUT 保存当前协议，更新本地配置和 JSON 编辑器。
   "schema_version": 1,
   "name": "示例产品生产测试",
   "product_model": "PRODUCT-100",
+  "station_code": "STATION-01",
   "variables": {
     "firmware_expected": "1.0.0",
     "voltage_min": 11.5,
@@ -1393,7 +1458,8 @@ PUT 保存当前协议，更新本地配置和 JSON 编辑器。
 ```
 
 - `schema_version` 当前固定为 1。
-- `name` 和 `product_model` 会进入运行及报告快照。
+- `name` 和 `product_model` 会进入运行及报告快照；`product_model` 应为主数据中的产品编号。
+- `station_code` 为可选的工站绑定（v1、v2 均支持），来自工站主数据；留空表示不限工站，保存时唯一性校验仅对绑定了工站的流程生效。
 - `variables` 是初始上下文，可被 `set` 动作覆盖。
 - `steps` 按数组顺序执行。
 
@@ -1575,6 +1641,34 @@ SN 绑定步骤建议同时校验产品返回 SN 与扫码 SN，避免扫了 A �
 
 `${report}` 整体作为值，因此发送时是嵌套对象，不是 JSON 字符串。
 
+## 10.2.1 默认主数据同步配置
+
+`DEFAULT_MES_CONFIG["master_data"]` 默认使用模拟器模式，接入真实 MES 时改为 `http` 并填写地址：
+
+```json
+{
+  "mode": "simulator",
+  "products": {
+    "url": "",
+    "method": "GET",
+    "headers": {},
+    "items_path": "data.list",
+    "field_map": {"code": "itemCode", "name": "itemName", "spec": "specification"},
+    "enabled": true
+  },
+  "stations": {
+    "url": "",
+    "method": "GET",
+    "headers": {},
+    "items_path": "data.list",
+    "field_map": {"code": "stationCode", "name": "stationName", "line": "lineCode", "station_type": "stationType"},
+    "enabled": true
+  }
+}
+```
+
+同步为手动触发（MES 页「同步」按钮或 `POST /api/mes/sync`），不做定时轮询。`items_path` 用点号路径从响应 JSON 中取数组（复用 `resolve_path()`），`field_map` 的值为 MES 报文中的源字段路径，键为目标字段。
+
 ## 10.3 自定义 MES 字段映射示例
 
 ```json
@@ -1736,6 +1830,7 @@ SN 绑定步骤建议同时校验产品返回 SN 与扫码 SN，避免扫了 A �
 - Windows 下后台结束和 SQLite 临时文件清理。
 - 固件烧录框架：固件登记/查找/校验和校验、仿真烧录进度与失败注入、外部工具烧录成功/失败/超时、后端工厂与目录的自动化测试。
 - 固件烧录集成：编译校验（含未登记固件拦截）、固件与烧录配置 API 及权限、v1/v2 流程烧录通过、失败注入标记步骤失败并落库 `flash_records`、报告携带烧录记录。
+- MES 主数据：模拟器同步产品与工站、重复同步幂等更新、本地数据增删改及与同步隔离、MES 响应缺失行自动停用、MES 行删除/改名拦截（409/422）、脚本绑定校验（未知产品/工站 422、停用 422、同工站重复 409、未绑工站保持自由模式）、启动测试工站不一致 409、操作工只读权限、旧 MES 配置自动合并 `master_data` 默认值、HTTP 模式配置校验。
 
 尚未在真实串口、CAN、Modbus、BLE、MQTT、J-Link 硬件上联调。协议适配代码已提供，但现场仍需验证具体设备驱动、电气连接、产品协议和超时。固件烧录框架同样未在真实烧录器上联调，J-Link 后端的安全解锁和量产校验仍是 TODO，详见 [固件烧录框架开发说明](FIRMWARE_FLASH.md)。
 
