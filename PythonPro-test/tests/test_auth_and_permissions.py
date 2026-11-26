@@ -105,3 +105,19 @@ def test_password_change_reissues_valid_session(isolated_api: Database) -> None:
     old_session = TestClient(app_module.app)
     old_session.cookies.set("pilot_session", old_cookie)
     assert old_session.get("/api/auth/me").status_code == 401
+
+
+def test_service_restart_invalidates_all_sessions(isolated_api: Database) -> None:
+    """服务重启（重新执行初始化）会轮换会话签名密钥，此前签发的登录 Cookie 全部失效。"""
+    client = TestClient(app_module.app)
+    login(client, "admin", "admin123")
+    assert client.get("/api/auth/me").status_code == 200
+
+    # 模拟服务重启：启动流程会重新执行 AuthService.initialize()
+    app_module.auth_service.initialize()
+
+    # 旧 Cookie 签名与新密钥不匹配，必须重新登录
+    assert client.get("/api/auth/me").status_code == 401
+    # 重新登录后签发的新 Cookie 正常工作
+    login(client, "admin", "admin123")
+    assert client.get("/api/auth/me").status_code == 200

@@ -61,6 +61,10 @@ class AuthService:
                     "enabled, session_version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 1, 1, ?, ?)",
                     (username, display_name, role, salt, _password_hash(password, salt), now, now),
                 )
+        # 每次服务启动都轮换会话签名密钥：重启后此前签发的所有登录 Cookie 立即失效，
+        # 强制全员重新登录（产线共用终端的安全策略）。密钥仍持久化在 settings 表中，
+        # 供本次运行期间签发/校验 Cookie 使用。
+        self.db.save_setting("auth_secret", secrets.token_urlsafe(48))
 
     def _secret(self) -> bytes:
         secret = self.db.setting("auth_secret")
