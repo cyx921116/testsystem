@@ -85,7 +85,7 @@ svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width:
 .card-header { display: flex; align-items: center; justify-content: space-between; gap: 15px; padding: 19px 21px; border-bottom: 1px solid #edf1f2; }
 .test-layout { display: grid; grid-template-columns: minmax(0, 1fr) 285px; gap: 20px; align-items: start; }
 .console-header { min-height: 77px; }
-.script-picker { display: flex; gap: 10px; width: min(520px, 58%); }
+.script-picker { display: flex; gap: 10px; width: min(760px, 62%); }
 .script-picker .picker-field { flex: 1; min-width: 0; }
 .script-picker label { display: block; margin-bottom: 5px; font-size: 10px; }
 .script-picker select { width: 100%; padding: 8px 10px; font-size: 12px; }
@@ -176,6 +176,18 @@ svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width:
 .script-list-item:hover { background: #f4f8f8; }.script-list-item.active { background: var(--primary-soft); border-color: #c3e2dc; }
 .script-list-item strong { display: block; font-size: 11px; margin-bottom: 5px; }.script-list-item span { display: block; font-size: 9px; color: var(--muted); }.script-list-item small { display: block; color: var(--primary); font-size: 8px; margin-top: 7px; }
 .script-list-item.disabled { opacity: .55; }
+.script-group { margin-bottom: 4px; }
+.script-group > summary { display: flex; align-items: center; gap: 8px; padding: 9px 10px; border-radius: 6px; cursor: pointer; list-style: none; user-select: none; }
+.script-group > summary::-webkit-details-marker { display: none; }
+.script-group > summary::before { content: "▸"; color: var(--muted); font-size: 10px; transition: transform .15s; }
+.script-group[open] > summary::before { transform: rotate(90deg); }
+.script-group > summary:hover { background: #f4f8f8; }
+.script-group-code { font-size: 11px; font-weight: 700; color: var(--sidebar); }
+.script-group summary small { color: var(--muted); font-size: 9px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.script-group summary .count-badge { margin-left: auto; }
+.script-group-add { padding: 2px 8px; font-size: 9px; }
+.script-group-items { padding: 2px 0 6px 16px; }
+.script-group-empty { padding: 6px 10px; color: var(--muted); font-size: 9px; }
 .script-editor-card { padding: 21px; }
 .editor-meta { display: grid; grid-template-columns: 2fr 1fr 1fr 1fr 110px 90px; gap: 14px; padding-bottom: 20px; border-bottom: 1px solid var(--border); }
 .version-box { padding: 7px 12px; border-left: 1px solid var(--border); }.version-box span { display: block; color: var(--muted); font-size: 9px; margin-bottom: 7px; }.version-box strong { font-size: 14px; }
@@ -217,6 +229,8 @@ svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width:
 .master-panel-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 0 10px; }.master-panel-head h3 { font-size: 12px; }
 .master-form { display: flex; flex-wrap: wrap; gap: 8px; padding: 12px 0 16px; border-top: 1px dashed var(--border); margin-top: 4px; }.master-form input { flex: 1 1 110px; min-width: 0; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; font: inherit; font-size: 11px; }
 .master-meta { color: var(--muted); font-size: 10px; }
+.master-panel .table-wrap { max-height: 330px; overflow-y: auto; }
+.master-panel .data-table thead th { position: sticky; top: 0; z-index: 2; box-shadow: 0 1px 0 var(--border); }
 .master-hint { padding: 10px 20px 16px; color: var(--muted); font-size: 10px; border-top: 1px solid var(--border); margin: 0; }
 .mapping-input { min-height: 210px; }
 .toggle-row { display: flex; align-items: center; justify-content: space-between; gap: 20px; cursor: pointer; padding: 12px 0; }.toggle-row > span strong { display: block; font-size: 11px; }.toggle-row > span small { display: block; font-weight: 400; color: var(--muted); margin-top: 5px; }.toggle-row input { position: absolute; opacity: 0; width: 0; }.toggle-row i { display: block; width: 37px; height: 21px; flex: 0 0 37px; border-radius: 12px; background: #c7d2d3; position: relative; transition: .2s; }.toggle-row i:after { content: ""; position: absolute; width: 15px; height: 15px; top: 3px; left: 3px; background: #fff; border-radius: 50%; transition: .2s; }.toggle-row input:checked + i { background: var(--primary); }.toggle-row input:checked + i:after { transform: translateX(16px); }

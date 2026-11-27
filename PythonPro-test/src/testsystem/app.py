@@ -98,6 +98,7 @@ class ScriptPayload(BaseModel):
 class SNPayload(BaseModel):
     sn: str = Field(min_length=1, max_length=128)
     script_id: int
+    station: str | None = Field(default=None, max_length=64)
 
 
 class StartPayload(SNPayload):
@@ -201,6 +202,12 @@ def _validate_sn(sn: str) -> str:
     if not matched:
         raise HTTPException(422, f"SN 格式不符合规则：{pattern}")
     return sn
+
+
+def _effective_station(station: str | None) -> str:
+    """本次测试的执行工站：执行台选中的测试工站即执行工站，未指定时回退到工位策略配置的终端工站。"""
+    value = (station or "").strip()
+    return value or str(database.setting("station_id", DEFAULT_SETTINGS["station_id"]))
 
 
 def _effective_max_retests(script: sqlite3.Row) -> int:
@@ -740,7 +747,7 @@ def scan_sn(payload: SNPayload) -> dict[str, Any]:
     )
     active = database.one(
         "SELECT id, sn FROM test_runs WHERE status = 'RUNNING' AND station = ?",
-        (database.setting("station_id"),),
+        (_effective_station(payload.station),),
     )
     max_retests = _effective_max_retests(script)
     max_attempts = 1 + max_retests
@@ -773,11 +780,11 @@ def scan_sn(payload: SNPayload) -> dict[str, Any]:
 def start_test(payload: StartPayload, request: Request) -> dict[str, Any]:
     sn = _validate_sn(payload.sn)
     script = _get_script(payload.script_id)
-    station = str(database.setting("station_id", DEFAULT_SETTINGS["station_id"]))
+    station = _effective_station(payload.station)
     operator = request.state.user["username"]
     script_station = (script["station_code"] or "").strip()
     if script_station and script_station != station:
-        raise HTTPException(409, f"该流程绑定工站 {script_station}，与当前工站 {station} 不一致，禁止执行")
+        raise HTTPException(409, f"该流程绑定工站 {script_station}，与所选测试工站 {station} 不一致，禁止执行")
     run_id = new_id("run")
     started_at = utc_now()
     definition = json.loads(script["definition_json"])
@@ -928,4 +935,5 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 @app.get("/", include_in_schema=False)
 def index() -> FileResponse:
-    return FileResponse(STATIC_DIR / "index.html")
+    # no-cache：浏览器每次都回源校验首页，避免服务重启/前端更新后仍展示缓存的旧页面
+    return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-cache"})

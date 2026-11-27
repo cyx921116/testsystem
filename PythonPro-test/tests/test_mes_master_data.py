@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -200,6 +202,69 @@ def test_start_test_rejects_station_mismatch(isolated_api: Database) -> None:
     assert scan.json()["can_start"] is True
     started = operator.post("/api/test-runs", json={"sn": "SN-ICT-0001", "script_id": script_id})
     assert started.status_code == 201, started.text
+
+
+def wait_run_finished(client: TestClient, run_id: str) -> dict:
+    run = client.get(f"/api/test-runs/{run_id}").json()
+    for _ in range(200):
+        if run["status"] != "RUNNING":
+            break
+        time.sleep(0.05)
+        run = client.get(f"/api/test-runs/{run_id}").json()
+    return run
+
+
+def test_start_test_with_selected_station(isolated_api: Database) -> None:
+    """执行台选中的测试工站即执行工站：随扫码/开始传入，与流程绑定工站一致即可执行。"""
+    admin = admin_client()
+    sync(admin)
+    created = admin.post("/api/scripts", json={"definition": script_definition("DEMO-100", "ICT-01")})
+    assert created.status_code == 201, created.text
+    script_id = created.json()["id"]
+
+    operator = operator_client()
+    # 所选工站与流程绑定工站不一致时拒绝执行（防止绕过前端直接构造请求）
+    scan = operator.post("/api/test-runs/scan", json={"sn": "SN-ICT-1001", "script_id": script_id, "station": "STATION-01"})
+    assert scan.status_code == 200, scan.text
+    mismatched = operator.post("/api/test-runs", json={"sn": "SN-ICT-1001", "script_id": script_id, "station": "STATION-01"})
+    assert mismatched.status_code == 409
+    assert "ICT-01" in mismatched.text and "STATION-01" in mismatched.text
+
+    # 选中流程绑定的工站即可执行，运行与报告记录所选工站，无需修改终端工位配置
+    scan = operator.post("/api/test-runs/scan", json={"sn": "SN-ICT-1001", "script_id": script_id, "station": "ICT-01"})
+    assert scan.json()["can_start"] is True
+    started = operator.post("/api/test-runs", json={"sn": "SN-ICT-1001", "script_id": script_id, "station": "ICT-01"})
+    assert started.status_code == 201, started.text
+    assert started.json()["station"] == "ICT-01"
+    run = wait_run_finished(operator, started.json()["id"])
+    assert run["status"] == "PASS"
+    assert run["station"] == "ICT-01"
+
+
+def test_scan_active_run_is_scoped_to_selected_station(isolated_api: Database) -> None:
+    admin = admin_client()
+    sync(admin)
+    slow = script_definition("DEMO-100")
+    slow["steps"][0]["actions"] = [{"type": "sleep", "duration_ms": 3000}]
+    created = admin.post("/api/scripts", json={"definition": slow})
+    assert created.status_code == 201, created.text
+    script_id = created.json()["id"]
+
+    operator = operator_client()
+    operator.post("/api/test-runs/scan", json={"sn": "SN-BUSY-01", "script_id": script_id, "station": "ICT-01"})
+    started = operator.post("/api/test-runs", json={"sn": "SN-BUSY-01", "script_id": script_id, "station": "ICT-01"})
+    assert started.status_code == 201, started.text
+
+    # 同工站扫码提示等待；其他工站不受该活动运行影响（执行器单工位串行执行，跨工站运行自动排队）
+    same = operator.post("/api/test-runs/scan", json={"sn": "SN-BUSY-02", "script_id": script_id, "station": "ICT-01"})
+    assert same.json()["can_start"] is False
+    assert same.json()["active_run_id"] == started.json()["id"]
+    other = operator.post("/api/test-runs/scan", json={"sn": "SN-BUSY-02", "script_id": script_id, "station": "STATION-01"})
+    assert other.json()["can_start"] is True
+    assert other.json()["active_run_id"] is None
+
+    run = wait_run_finished(operator, started.json()["id"])
+    assert run["status"] == "PASS"
 
 
 def test_operator_master_data_permissions(isolated_api: Database) -> None:

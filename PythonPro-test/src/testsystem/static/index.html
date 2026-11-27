@@ -5,11 +5,11 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#142b3a">
   <title>Pilot 生产测试系统</title>
-  <link rel="stylesheet" href="/static/styles.css">
-  <link rel="stylesheet" href="/static/flow-editor.css">
-  <script src="/static/flow-model.js" defer></script>
-  <script src="/static/flow-editor.js" defer></script>
-  <script src="/static/app.js" defer></script>
+  <link rel="stylesheet" href="/static/styles.css?v=0.3.5">
+  <link rel="stylesheet" href="/static/flow-editor.css?v=0.3.5">
+  <script src="/static/flow-model.js?v=0.3.5" defer></script>
+  <script src="/static/flow-editor.js?v=0.3.5" defer></script>
+  <script src="/static/app.js?v=0.3.5" defer></script>
 </head>
 <body>
   <div class="auth-screen" id="auth-screen">
@@ -291,7 +291,7 @@
                 <small>HTTP 模式下地址、列表路径和字段映射必填；模拟器模式无需填写。查询方法默认 GET，可在完整 MES 配置 JSON 中调整。</small>
               </div></article>
               <article class="card config-card"><div class="card-header"><div><span class="eyebrow">STATION POLICY</span><h2>工位策略</h2></div></div><div class="config-grid single">
-                <div class="field"><label for="setting-station">工位编号</label><input id="setting-station" list="station-options" placeholder="从工站主数据选择，如 STATION-01"></div>
+                <div class="field"><label for="setting-station">工位编号</label><select id="setting-station"></select><small>候选来自工站主数据，点“同步工站”后更新</small></div>
                 <div class="field"><label for="setting-operator">默认操作员</label><input id="setting-operator"></div>
                 <div class="field"><label for="setting-sn-pattern">SN 正则校验规则</label><input id="setting-sn-pattern" class="mono"></div>
                 <div class="field"><label for="setting-max-retests">失败复测次数上限（0-20）</label><input id="setting-max-retests" type="number" min="0" max="20" step="1"><small>测试失败的 SN 允许复测的次数；0 表示失败后禁止复测，已合格的 SN 始终禁止重复测试</small></div>
