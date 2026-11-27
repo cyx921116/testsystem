@@ -1070,7 +1070,7 @@ Pydantic 在业务函数之前拒绝缺失或类型明显错误的请求。
 
 ### 模拟器数据源
 
-`SIMULATOR_PRODUCTS` / `SIMULATOR_STATIONS` 在未接入真实 MES 时提供示例数据（含默认脚本使用的 `DEMO-100` 和默认工位 `STATION-01`），字段与 HTTP 模式映射后的目标字段一致，便于无 MES 环境验证完整流程。
+`SIMULATOR_PRODUCTS` / `SIMULATOR_STATIONS` 在未接入真实 MES 时提供示例数据（25 个产品、20 个工站，含默认脚本使用的 `DEMO-100` 和默认工位 `STATION-01`），字段与 HTTP 模式映射后的目标字段一致，便于无 MES 环境验证同步、绑定、生产台索引等完整流程。
 
 ### `MESMasterData.sync(target)`
 
