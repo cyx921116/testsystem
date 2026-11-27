@@ -35,6 +35,7 @@ def firmware_dir() -> Path:
 
 
 def sha256_file(path: str | Path) -> str:
+    """分块计算文件 SHA-256（1MB 一块，固件文件可能很大）。"""
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
@@ -43,6 +44,7 @@ def sha256_file(path: str | Path) -> str:
 
 
 def load_firmware_index() -> list[dict[str, Any]]:
+    """读取固件仓清单（firmware.json）；文件不存在视为空仓，格式错误抛 FlashError。"""
     index_path = firmware_dir() / INDEX_FILE
     if not index_path.exists():
         return []
@@ -56,6 +58,7 @@ def load_firmware_index() -> list[dict[str, Any]]:
 
 
 def save_firmware_index(index: list[dict[str, Any]]) -> None:
+    """把固件仓清单写回 firmware.json（目录不存在时自动创建）。"""
     directory = firmware_dir()
     directory.mkdir(parents=True, exist_ok=True)
     (directory / INDEX_FILE).write_text(json_dumps(index), encoding="utf-8")
@@ -113,6 +116,7 @@ def find_firmware(name_or_id: str) -> dict[str, Any]:
 
 
 def default_flash_options() -> dict[str, Any]:
+    """烧录默认选项：擦除、校验、复位开启，超时 60 秒。"""
     return {"erase": True, "verify": True, "reset": True, "timeout_ms": 60000}
 
 
@@ -204,6 +208,7 @@ class SimulatorFlasher(BaseFlasher):
         return {"ok": True, "message": "仿真烧录器就绪"}
 
     def flash(self, request: dict[str, Any], on_progress: ProgressCallback | None = None) -> dict[str, Any]:
+        """按选项组合出阶段序列逐段模拟；fail_at_stage 命中的阶段抛错，用于演示失败路径。"""
         request = validate_flash_request(request)
         firmware = find_firmware(request["firmware"])
         options = request["options"]
@@ -253,6 +258,7 @@ class JLinkFlasher(BaseFlasher):
         return {"ok": True, "message": "pylink-square 可用"}
 
     def flash(self, request: dict[str, Any], on_progress: ProgressCallback | None = None) -> dict[str, Any]:
+        """J-Link 烧录主流程：连接 → 擦除 → 下载 → 校验 → 复位；设备句柄在 finally 中关闭。"""
         request = validate_flash_request(request)
         firmware = find_firmware(request["firmware"])
         options = request["options"]
@@ -319,6 +325,7 @@ class ExternalToolFlasher(BaseFlasher):
         return {"ok": True, "message": "已配置外部烧录命令"}
 
     def flash(self, request: dict[str, Any], on_progress: ProgressCallback | None = None) -> dict[str, Any]:
+        """渲染命令模板并执行外部工具：返回码为 0 且输出含 success_text（若配置）才算成功。"""
         request = validate_flash_request(request)
         firmware = find_firmware(request["firmware"])
         command_template = str(self.config.get("command", ""))
@@ -369,12 +376,14 @@ def _split_command(command: str) -> list[str]:
     return shlex.split(command)
 
 
+# 烧录后端注册表：名称 → 实现类
 FLASHER_CLASSES = {
     "simulator": SimulatorFlasher,
     "jlink": JLinkFlasher,
     "external_tool": ExternalToolFlasher,
 }
 
+# 后端 → 依赖的驱动模块（None 表示无外部依赖），用于目录中的“驱动可用”标记
 DRIVER_MODULES = {
     "simulator": None,
     "jlink": "pylink",
@@ -383,6 +392,7 @@ DRIVER_MODULES = {
 
 
 def create_flasher(name: str, config: dict[str, Any] | None = None) -> BaseFlasher:
+    """按名称实例化烧录后端；未知名称抛 FlashError。"""
     try:
         return FLASHER_CLASSES[name](config)
     except KeyError as exc:
@@ -390,6 +400,7 @@ def create_flasher(name: str, config: dict[str, Any] | None = None) -> BaseFlash
 
 
 def flasher_catalog() -> list[dict[str, Any]]:
+    """烧录后端目录（固件烧录页下拉用）：描述取类 docstring 首行，并标记驱动可用性。"""
     catalog = []
     for name, cls in FLASHER_CLASSES.items():
         module = DRIVER_MODULES[name]

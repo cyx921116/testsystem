@@ -1,3 +1,13 @@
+"""测试执行器：在后台线程中运行测试流程，落库逐项结果并生成唯一报告。
+
+结构：
+- ``TestExecutor`` 用单工作线程池串行执行运行（单工位一次只测一台产品，
+  也避免并发访问同一套硬件；并行需求由控制流 parallel 节点在运行内部解决）；
+- v1 步骤式流程由 ``_execute_run`` 顺序执行，v2 控制流流程转交 ControlFlowRunner；
+- 动作执行（``_execute_actions``）与断言（``_assert``）为两种流程共用；
+- 运行结束统一走 ``_finalize``：汇总测试项/控制流/烧录记录生成唯一正式报告，
+  并按工位策略决定是否自动上传 MES。
+"""
 from __future__ import annotations
 
 import json
@@ -15,6 +25,8 @@ from .utils import json_dumps, new_id, render_template, resolve_value, utc_now
 
 
 class StepFailure(RuntimeError):
+    """测试项失败：携带实际值/期望值/断言明细，供报告展示失败原因。"""
+
     def __init__(
         self,
         message: str,
@@ -30,6 +42,7 @@ class StepFailure(RuntimeError):
 
 
 def _text(value: Any) -> str:
+    """把任意值转为可入库的展示文本（对象转 JSON，None 转空串）。"""
     if value is None:
         return ""
     if isinstance(value, (dict, list)):
@@ -38,11 +51,17 @@ def _text(value: Any) -> str:
 
 
 def _elapsed_ms(started_at: str) -> int:
+    """从 ISO 时间戳到当前的毫秒数（报告总耗时）。"""
     started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
     return max(0, round((datetime.now(UTC) - started).total_seconds() * 1000))
 
 
 def _assert(actual: Any, operator: str, expected: Any) -> bool:
+    """断言判定：相等/包含/正则/数值比较/区间/为真/非空。
+
+    数值类比较会把两侧转为 float，转换失败抛 ValueError，由调用方包装为
+    “断言数据无法比较”的测试项失败。
+    """
     if operator == "equals":
         return actual == expected
     if operator == "not_equals":
@@ -72,17 +91,23 @@ def _assert(actual: Any, operator: str, expected: Any) -> bool:
 
 
 class TestExecutor:
+    """后台执行器：接收运行 ID，串行执行并负责收尾（报告 + 自动上传）。"""
+
     def __init__(self, database: Database):
         self.db = database
+        # 单工作线程：运行串行执行，避免并发争用串口等硬件；多运行自动排队
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="production-test")
 
     def submit(self, run_id: str) -> None:
+        """把运行提交到后台线程（立即返回，前端轮询运行状态）。"""
         self.pool.submit(self._run_safely, run_id)
 
     def shutdown(self) -> None:
+        """服务停止时等待当前运行结束并取消排队任务。"""
         self.pool.shutdown(wait=True, cancel_futures=True)
 
     def _protocol(self, name: str, cache: dict[str, BaseProtocol], context: dict[str, Any]) -> BaseProtocol:
+        """按协议名取本次运行的协议连接（懒创建并缓存），并向仿真器注入运行上下文。"""
         if name not in cache:
             row = self.db.one("SELECT config_json FROM protocol_configs WHERE name = ?", (name,))
             if row is None:
@@ -94,12 +119,14 @@ class TestExecutor:
         return protocol
 
     def _flasher(self, cache: dict[str, Any]) -> Any:
+        """取本次运行的烧录器（按工位烧录配置懒创建并缓存）。"""
         if "active" not in cache:
             config = self.db.setting("flasher", DEFAULT_FLASHER_CONFIG)
             cache["active"] = create_flasher(config.get("backend", "simulator"), config.get("config") or {})
         return cache["active"]
 
     def _record_flash(self, request: dict[str, Any], result: dict[str, Any], context: dict[str, Any]) -> None:
+        """烧录留痕：无论成败都写入 flash_records（固件、校验和、结果），供报告追溯。"""
         record = build_flash_record(request, result, context)
         firmware = record.get("firmware") or {}
         self.db.execute(
@@ -133,6 +160,7 @@ class TestExecutor:
         on_progress: Any,
         item_path: str,
     ) -> dict[str, Any]:
+        """执行固件烧录动作：渲染模板参数 → 调烧录后端 → 留痕；失败转为 StepFailure。"""
         flasher = self._flasher(flashers)
         request = {
             "firmware": render_template(action["firmware"], context),
@@ -172,6 +200,11 @@ class TestExecutor:
         on_progress: Any = None,
         item_path: str = "",
     ) -> tuple[Any, Any, list[dict[str, Any]]]:
+        """顺序执行一个测试项的全部动作，返回（最后值, 期望值, 断言明细）。
+
+        每个动作前检查测试项级超时；通讯响应存入 last_response 与 save_as 变量
+        供后续动作/断言用 ${} 引用；断言失败立即抛 StepFailure 中断本测试项。
+        """
         started = time.monotonic()
         last_value: Any = None
         last_expected: Any = None
@@ -205,6 +238,7 @@ class TestExecutor:
             protocol = self._protocol(step["protocol"], protocols, context)
             if action_type == "request":
                 data = render_template(action["data"], context)
+                # 请求超时取“测试项剩余预算”，避免单动作耗尽整个测试项时限
                 remaining = max(1, int(step["timeout_ms"] - elapsed_ms))
                 last_value = protocol.request(data, action.get("encoding"), remaining)
                 context["last_response"] = last_value
@@ -249,6 +283,7 @@ class TestExecutor:
         return last_value, last_expected, assertions
 
     def _flash_progress(self, run_id: str, item_id: str) -> Any:
+        """生成烧录进度回调：把百分比与阶段消息写到测试项 message，前端轮询可见。"""
         def report(percent: int, message: str) -> None:
             self.db.execute(
                 "UPDATE test_items SET message = ? WHERE run_id = ? AND item_id = ?",
@@ -258,6 +293,7 @@ class TestExecutor:
         return report
 
     def _run_safely(self, run_id: str) -> None:
+        """运行外壳：兜底捕获一切异常（运行标记失败），最后统一生成报告并按需上传 MES。"""
         protocols: dict[str, BaseProtocol] = {}
         flashers: dict[str, Any] = {}
         try:
@@ -274,6 +310,7 @@ class TestExecutor:
                 (str(exc), run_id),
             )
         finally:
+            # 关闭本次运行打开的所有硬件连接（正常/异常路径都要释放）
             for protocol in protocols.values():
                 try:
                     protocol.close()
@@ -292,6 +329,7 @@ class TestExecutor:
                 try:
                     MESUploader(self.db).upload(report_id)
                 except Exception:
+                    # 自动上传失败不阻塞测试流程：报告已保留 FAILED 状态，可在报告中心重试
                     pass
         except Exception:
             self.db.execute(
@@ -300,6 +338,7 @@ class TestExecutor:
             )
 
     def _execute_run(self, run_id: str, protocols: dict[str, BaseProtocol], flashers: dict[str, Any]) -> None:
+        """执行一次运行：v2 控制流交 ControlFlowRunner；v1 逐步骤执行并处理重试/失败策略。"""
         run = self.db.one("SELECT * FROM test_runs WHERE id = ?", (run_id,))
         if run is None or run["status"] != "RUNNING":
             return
@@ -320,6 +359,7 @@ class TestExecutor:
         stop_remaining = False
         for index, step in enumerate(script["steps"]):
             if stop_remaining:
+                # on_fail=stop 的失败项之后的所有步骤标记为未执行
                 self.db.execute(
                     "UPDATE test_items SET status = 'FAIL', message = ?, finished_at = ? WHERE run_id = ? AND item_id = ?",
                     ("前序测试失败，本项未执行", utc_now(), run_id, step["id"]),
@@ -384,6 +424,11 @@ class TestExecutor:
                 stop_remaining = True
 
     def _finalize(self, run_id: str) -> str:
+        """收尾：汇总测试项/控制流/烧录记录生成唯一正式报告，返回报告 ID。
+
+        整体结果判定：全部测试项通过且无执行错误、无失败/中断的控制节点才是 PASS；
+        每次运行（含复测）各生成一份报告永久留档，失败报告不再删除。
+        """
         with self.db.transaction() as connection:
             existing = connection.execute("SELECT id FROM reports WHERE run_id = ?", (run_id,)).fetchone()
             if existing:
@@ -402,6 +447,7 @@ class TestExecutor:
                     "iteration": row["iteration"],
                     "name": row["item_name"],
                     "sequence": row["sequence"],
+                    # 收尾时仍处于 PENDING/RUNNING 的项按失败计入（异常中断场景）
                     "status": "FAIL" if row["status"] in {"PENDING", "RUNNING"} else row["status"],
                     "expected": row["expected"],
                     "actual": row["actual"],

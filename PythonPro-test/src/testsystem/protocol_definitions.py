@@ -1,3 +1,10 @@
+"""协议目录：每种通讯协议的页面表单字段定义与默认配置。
+
+通讯配置页按这里的 fields 渲染表单（分组：connection 连接参数 / downlink 下发编码 /
+uplink 响应解析），``depends_on`` 实现字段联动（如选择“十进制”格式才显示数值类型）。
+文件末尾把编解码字段统一追加到各协议，并汇总出 ``DEFAULT_PROTOCOL_CONFIGS``
+供数据库初始化时写入 protocol_configs 表。
+"""
 from __future__ import annotations
 
 from typing import Any
@@ -16,6 +23,7 @@ def field(
     help: str = "",
     depends_on: dict[str, str] | None = None,
 ) -> dict[str, Any]:
+    """构造一个表单字段描述：kind 支持 text/number/select/checkbox/password/json。"""
     return {
         "key": key,
         "label": label,
@@ -30,6 +38,7 @@ def field(
     }
 
 
+# 各协议的连接参数字段定义（编解码字段由 codec_fields 统一追加）
 PROTOCOL_DEFINITIONS: dict[str, dict[str, Any]] = {
     "simulator": {
         "label": "内置仿真器",
@@ -147,6 +156,7 @@ PROTOCOL_DEFINITIONS: dict[str, dict[str, Any]] = {
 }
 
 
+# 十进制编解码共用的下拉选项
 VALUE_TYPE_OPTIONS = [
     {"value": value, "label": label}
     for value, label in [
@@ -167,6 +177,11 @@ BYTE_ORDER_OPTIONS = [
 
 
 def codec_fields(send_format: str, receive_format: str) -> list[dict[str, Any]]:
+    """生成下发编码（downlink）与响应解析（uplink）两组通用字段。
+
+    send_format/receive_format 为该协议的默认格式；数值类型、字节序、缩放、偏移等
+    字段通过 depends_on 挂在 decimal 选项上，仅当用户选择“十进制”时才显示。
+    """
     decimal_send = {"key": "send_format", "value": "decimal"}
     decimal_receive = {"key": "receive_format", "value": "decimal"}
     return [
@@ -206,6 +221,8 @@ def codec_fields(send_format: str, receive_format: str) -> list[dict[str, Any]]:
     ]
 
 
+# 给需要编解码的协议统一追加通用字段（CAN 默认十进制二进制帧，其余默认文本）；
+# modbus/jlink 走 execute 操作语义，不经过通用编解码，故不追加
 for protocol_name, send_default, receive_default in [
     ("serial", "text", "text"),
     ("can", "decimal", "decimal"),
@@ -217,6 +234,7 @@ for protocol_name, send_default, receive_default in [
     PROTOCOL_DEFINITIONS[protocol_name]["fields"].extend(codec_fields(send_default, receive_default))
 
 
+# 各协议的默认连接配置（字段默认值汇总），数据库初始化时写入 protocol_configs 表
 DEFAULT_PROTOCOL_CONFIGS = {
     name: {item["key"]: item["default"] for item in definition["fields"]}
     for name, definition in PROTOCOL_DEFINITIONS.items()

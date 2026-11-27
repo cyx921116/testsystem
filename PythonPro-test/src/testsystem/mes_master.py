@@ -1,3 +1,12 @@
+"""MES 主数据：产品/工站的同步、查询与本地维护。
+
+MES 是产品与工站编号的权威来源，本地缓存于 mes_products / mes_stations 表：
+- 同步（sync）：simulator 模式用内置示例数据（SIMULATOR_PRODUCTS/STATIONS），
+  http 模式按 MES 配置（地址、列表路径、字段映射）拉取；以 code 为准 upsert，
+  MES 响应中消失的行自动停用，本地添加的行不受同步影响；
+- 本地维护：本地行可增删改，MES 行只能启用/停用（权威数据不可本地篡改）；
+- 主数据为空时脚本绑定保持自由文本模式，便于 demo 与离线使用。
+"""
 from __future__ import annotations
 
 import json
@@ -88,27 +97,33 @@ ENTITY_FIELDS = {
 
 
 class MESMasterData:
+    """主数据服务：封装两种来源（模拟器/HTTP）的同步与本地维护规则。"""
+
     def __init__(self, database: Database):
         self.db = database
 
     def master_config(self) -> dict[str, Any]:
+        """从 MES 配置中取出 master_data 段（缺失时返回空字典，按模拟器模式处理）。"""
         mes = self.db.setting("mes", {}) or {}
         master = mes.get("master_data")
         return master if isinstance(master, dict) else {}
 
     @staticmethod
     def _require_entity(entity: str) -> None:
+        """实体白名单校验：只允许 products / stations，防注入拼表名。"""
         if entity not in ENTITY_FIELDS:
             raise MESMasterError(f"未知的主数据类型：{entity}")
 
     # ------------------------------------------------------------------ 同步
     def sync(self, target: str) -> dict[str, Any]:
+        """同步入口：target 为 products / stations / both，返回各实体的新增/更新/停用统计。"""
         if target not in {"products", "stations", "both"}:
             raise MESMasterError("同步目标必须是 products、stations 或 both")
         entities = ("products", "stations") if target == "both" else (target,)
         return {entity: self._sync_entity(entity) for entity in entities}
 
     def _sync_entity(self, entity: str) -> dict[str, Any]:
+        """同步单个实体：按 code upsert MES 行，响应中消失的 MES 行停用（本地行不动）。"""
         config = self.master_config().get(entity) or {}
         if config.get("enabled", True) is False:
             raise MESMasterError(f"{entity} 同步未启用，请先在 MES 配置中开启")
@@ -155,6 +170,7 @@ class MESMasterData:
         return {"total": len(seen), "added": added, "updated": updated, "disabled": disabled, "synced_at": now}
 
     def _fetch_items(self, entity: str, config: dict[str, Any]) -> list[dict[str, Any]]:
+        """按主数据模式取数：simulator 返回内置示例，http 走真实接口。"""
         mode = str(self.master_config().get("mode", "simulator")).strip().lower()
         if mode == "simulator":
             source = SIMULATOR_PRODUCTS if entity == "products" else SIMULATOR_STATIONS
@@ -164,6 +180,7 @@ class MESMasterData:
         raise MESMasterError(f"未知的主数据模式：{mode}，仅支持 simulator 或 http")
 
     def _fetch_http(self, entity: str, config: dict[str, Any]) -> list[dict[str, Any]]:
+        """HTTP 模式取数：GET/POST 查询 MES，按 items_path 定位列表、field_map 映射字段。"""
         url = str(config.get("url", "")).strip()
         if not url.startswith(("http://", "https://")):
             raise MESMasterError(f"MES {entity} 查询地址必须是 HTTP/HTTPS URL")
@@ -217,6 +234,7 @@ class MESMasterData:
 
     # ------------------------------------------------------------------ 查询
     def list_items(self, entity: str, include_disabled: bool = True) -> dict[str, Any]:
+        """列出主数据（可按需隐藏停用行），附带数据模式与最近同步时间。"""
         self._require_entity(entity)
         where = "" if include_disabled else "WHERE enabled = 1"
         rows = self.db.all(f"SELECT * FROM mes_{entity} {where} ORDER BY code")
@@ -228,6 +246,7 @@ class MESMasterData:
         }
 
     def get_item(self, entity: str, code: str) -> dict[str, Any]:
+        """按编号取单条主数据；不存在抛 MESMasterMissingError（映射为 404）。"""
         self._require_entity(entity)
         row = self.db.one(f"SELECT * FROM mes_{entity} WHERE code = ?", (code,))
         if row is None:
@@ -236,6 +255,7 @@ class MESMasterData:
 
     @staticmethod
     def _serialize(entity: str, row: sqlite3.Row) -> dict[str, Any]:
+        """输出行数据：白名单字段 + 来源/启用/时间戳（raw_json 仅内部留档，不外发）。"""
         item: dict[str, Any] = {field: row[field] for field in ENTITY_FIELDS[entity]}
         item.update(
             source=row["source"],
@@ -247,6 +267,7 @@ class MESMasterData:
 
     # ------------------------------------------------------------------ 本地维护
     def create_item(self, entity: str, data: dict[str, Any]) -> dict[str, Any]:
+        """添加本地行（source='local'）：编号/名称必填，编号重复抛冲突错误（409）。"""
         self._require_entity(entity)
         fields = ENTITY_FIELDS[entity]
         code = str(data.get("code", "")).strip()
@@ -269,6 +290,7 @@ class MESMasterData:
         return self.get_item(entity, code)
 
     def update_item(self, entity: str, code: str, data: dict[str, Any]) -> dict[str, Any]:
+        """更新主数据：MES 行仅允许启用/停用（权威数据在 MES 侧维护），本地行可改名称与属性。"""
         self._require_entity(entity)
         fields = ENTITY_FIELDS[entity]
         current = self.db.one(f"SELECT * FROM mes_{entity} WHERE code = ?", (code,))
@@ -301,6 +323,7 @@ class MESMasterData:
         return self.get_item(entity, code)
 
     def delete_item(self, entity: str, code: str) -> None:
+        """删除本地行；MES 同步行禁止本地删除（可在 MES 端删除后同步，或本地停用）。"""
         self._require_entity(entity)
         current = self.db.one(f"SELECT source FROM mes_{entity} WHERE code = ?", (code,))
         if current is None:

@@ -1,3 +1,13 @@
+/**
+ * 图形流程编辑器（React + @xyflow/react + dagre 自动布局）。
+ *
+ * 这是 flow-editor.js（static 下的构建产物）的源码，构建命令：npx vite build。
+ * 通过 mount()/setDefinition()/setFirmware() 与 app.js 交互：
+ * app.js 把流程草稿传入画布，画布每次编辑经 onChange 回写同一份草稿，
+ * 与步骤列表/高级 JSON 编辑器保持同步（最终都编译为同一份流程 JSON）。
+ *
+ * 布局：左栏节点库（拖入/点击添加）+ 中间只读连线画布（拖动排序）+ 右栏节点检查器。
+ */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { DragEvent, MouseEvent as ReactMouseEvent } from "react";
 import { createRoot } from "react-dom/client";
@@ -34,6 +44,7 @@ import {
 import type { Action, Assertion, FirmwareInfo, FlowDefinition, FlowNode, NodeType, Path } from "./types";
 import { actionLabels, nodeLabels, operatorLabels } from "./types";
 
+/** 画布节点携带的数据：流程节点（含 AST 与路径）或并行汇合点。 */
 interface PilotNodeData extends Record<string, unknown> {
   kind: "flow" | "join";
   ast?: FlowNode;
@@ -49,6 +60,7 @@ interface GraphResult {
   edges: Edge[];
 }
 
+/** 动作的一行摘要（画布节点内显示前 3 个动作）。 */
 function actionSummary(action: Action): string {
   if (["request", "send"].includes(action.type)) return String(action.data ?? "");
   if (action.type === "assert") return `${String(action.actual ?? "")} ${String(action.operator)} ${String(action.expected ?? "")}`;
@@ -59,6 +71,7 @@ function actionSummary(action: Action): string {
   return String(action.save_as ?? action.type);
 }
 
+/** 自定义画布节点：按节点类型渲染摘要信息（测试项动作、条件分支计数、并行分支等）。 */
 function PilotNode({ data, selected }: NodeProps) {
   const nodeData = data as PilotNodeData;
   if (nodeData.kind === "join") {
@@ -81,6 +94,7 @@ function PilotNode({ data, selected }: NodeProps) {
 }
 
 const nodeTypes = { pilot: PilotNode };
+/** 节点库中各类型的用途说明。 */
 const nodeDescriptions: Record<NodeType, string> = {
   test: "通讯、采集与结果判定",
   condition: "按结果选择执行分支",
@@ -89,6 +103,11 @@ const nodeDescriptions: Record<NodeType, string> = {
   subflow: "复用已有测试任务",
 };
 
+/**
+ * 把流程定义转换为 React Flow 的节点与边：
+ * 顺序节点纵向相连；条件节点引出 TRUE/FALSE 两条边；并行节点经各分支到汇合点（join）；
+ * 循环体回边指向自身。最后交给 dagre 做层次自动布局（TB 方向）。
+ */
 function buildGraph(definition: FlowDefinition, currentFlow: string): GraphResult {
   const nodes: PilotRfNode[] = [];
   const edges: Edge[] = [];
@@ -161,12 +180,14 @@ interface EditorProps {
   onChange: (definition: FlowDefinition) => void;
 }
 
+// 供 app.js 调用的外部句柄（mount 前调用也能生效：先存 latest*，挂载后由副作用应用）
 let externalSetDefinition: ((definition: FlowDefinition) => void) | null = null;
 let externalSetFirmware: ((firmware: FirmwareInfo[]) => void) | null = null;
 let latestDefinition: FlowDefinition | null = null;
 let latestFirmware: FirmwareInfo[] = [];
 let editorRoot: Root | null = null;
 
+/** 编辑器主组件：画布状态、节点增删/排序、子流程切换与检查器联动。 */
 function FlowEditorApp({ initialDefinition, onChange }: EditorProps) {
   const [definition, setDefinition] = useState(() => normalizeDefinition(latestDefinition || initialDefinition));
   const definitionRef = useRef(definition);
@@ -187,6 +208,7 @@ function FlowEditorApp({ initialDefinition, onChange }: EditorProps) {
     onChangeRef.current = onChange;
   }, [onChange]);
   useEffect(() => setNodes(layout.nodes), [layout.nodes]);
+  /** 画布从隐藏变为可见（切换页面）时自动 fitView，避免节点渲染在视口外。 */
   useEffect(() => {
     const element = canvasRef.current;
     if (!element) return;
@@ -245,6 +267,7 @@ function FlowEditorApp({ initialDefinition, onChange }: EditorProps) {
     return () => { externalSetFirmware = null; };
   }, []);
 
+  /** 所有编辑的统一出口：规范化 → 更新本地状态 → 回写 app.js 草稿。 */
   const updateDefinition = useCallback((next: FlowDefinition) => {
     const normalized = normalizeDefinition(next);
     definitionRef.current = normalized;
@@ -252,6 +275,7 @@ function FlowEditorApp({ initialDefinition, onChange }: EditorProps) {
     onChangeRef.current(normalized);
   }, []);
 
+  /** 添加节点：默认追加到当前流程末尾；首个子流程节点会自动补一个示例子流程。 */
   const addNode = useCallback((type: NodeType, sequencePath?: Path, index?: number) => {
     let next = definitionRef.current;
     if (type === "subflow" && !Object.keys(next.subflows).length) {
@@ -268,6 +292,7 @@ function FlowEditorApp({ initialDefinition, onChange }: EditorProps) {
     setSelectedPath([...path, target]);
   }, [currentFlow, updateDefinition]);
 
+  /** 节点库点击添加：落在选中节点的内部（条件/循环/并行）或其后。 */
   const addFromPalette = useCallback((type: NodeType) => {
     if (!selectedPath) {
       addNode(type);
@@ -286,6 +311,7 @@ function FlowEditorApp({ initialDefinition, onChange }: EditorProps) {
     }
   }, [selectedPath, addNode]);
 
+  /** 拖动结束：按画布纵坐标重排同层节点顺序（只影响同序列，不改变嵌套归属）。 */
   const onNodeDragStop: OnNodeDrag = useCallback((_event, dragged) => {
     const data = dragged.data as PilotNodeData;
     if (!data.sequencePath || data.index === undefined) return;
@@ -306,6 +332,7 @@ function FlowEditorApp({ initialDefinition, onChange }: EditorProps) {
     if (data.path) setSelectedPath(data.path);
   }, []);
 
+  /** 从节点库拖拽落点添加：落在容器节点内部，或目标节点的其后。 */
   const onDrop = useCallback((event: DragEvent) => {
     event.preventDefault();
     const type = event.dataTransfer.getData("application/pilot-node") as NodeType;
@@ -324,6 +351,7 @@ function FlowEditorApp({ initialDefinition, onChange }: EditorProps) {
     }
   }, [nodes, addNode]);
 
+  /** 新建子流程并切换到它。 */
   const addSubflow = useCallback(() => {
     const id = createId("subflow");
     const next = clone(definitionRef.current);
@@ -340,6 +368,7 @@ function FlowEditorApp({ initialDefinition, onChange }: EditorProps) {
     setSelectedPath(null);
   }, []);
 
+  /** 删除当前子流程：仍被引用时拒绝并列出引用位置。 */
   const deleteCurrentSubflow = useCallback(() => {
     if (currentFlow === "main") return;
     const references = findSubflowReferences(definitionRef.current, currentFlow);
@@ -356,6 +385,7 @@ function FlowEditorApp({ initialDefinition, onChange }: EditorProps) {
     setSelectedPath(null);
   }, [currentFlow, updateDefinition]);
 
+  /** 复制选中的测试项（新 ID + “副本”名称），插到原节点之后。 */
   const duplicateSelected = useCallback(() => {
     if (!selectedPath) return;
     const original = getAt<FlowNode>(definitionRef.current, selectedPath);
@@ -434,10 +464,12 @@ function FlowEditorApp({ initialDefinition, onChange }: EditorProps) {
   );
 }
 
+/** 检查器通用字段包装：标签 + 控件 + 可选提示。 */
 function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
   return <label className="pilot-field"><span>{label}</span>{children}{hint && <small className="pilot-field-hint">{hint}</small>}</label>;
 }
 
+/** JSON 编辑框：本地保留文本态，仅在解析成功时回写（非法输入标红不打断输入）。 */
 function JsonField({ value, onChange }: { value: unknown; onChange: (value: unknown) => void }) {
   const serialized = JSON.stringify(value ?? {}, null, 2);
   const [text, setText] = useState(serialized);
@@ -461,11 +493,13 @@ function JsonField({ value, onChange }: { value: unknown; onChange: (value: unkn
   />;
 }
 
+/** 输入文本智能转型：纯十进制数字转 Number，其余保持字符串。 */
 function decimalOrText(text: string): unknown {
   const trimmed = text.trim();
   return /^-?(?:\d+(?:\.\d*)?|\.\d+)$/.test(trimmed) ? Number(trimmed) : text;
 }
 
+/** 断言/条件编辑字段组：按操作符切换期望值输入形态（区间双输入、数值、文本）。 */
 function AssertionFields({ value, onChange }: { value: Assertion; onChange: (value: Assertion) => void }) {
   const assertion = value || { actual: "${response}", operator: "equals", expected: "PASS" };
   const bounds = Array.isArray(assertion.expected) ? [...assertion.expected] : [0, 1];
@@ -497,6 +531,7 @@ function AssertionFields({ value, onChange }: { value: Assertion; onChange: (val
   </div>;
 }
 
+/** 十进制列表输入（J-Link 写内存字节等）：逗号/空白分隔，全部合法才回写。 */
 function DecimalListInput({ value, onChange }: { value: unknown; onChange: (value: number[]) => void }) {
   const serialized = Array.isArray(value) ? value.join(", ") : "";
   const [text, setText] = useState(serialized);
@@ -512,6 +547,7 @@ function DecimalListInput({ value, onChange }: { value: unknown; onChange: (valu
   }} />;
 }
 
+// execute 动作的设备操作选项（Modbus / J-Link），与 protocols.py 的执行分支一一对应
 const modbusOperations: Record<string, string> = {
   read_holding_registers: "读保持寄存器",
   read_input_registers: "读输入寄存器",
@@ -530,6 +566,7 @@ const jlinkOperations: Record<string, string> = {
   go: "运行",
 };
 
+/** 动作参数编辑表单：按动作类型渲染对应字段；Modbus/J-Link 的 execute 提供结构化参数。 */
 function ActionFields({ action, protocol, firmware, onChange }: { action: Action; protocol?: string; firmware: FirmwareInfo[]; onChange: (action: Action) => void }) {
   const update = (patch: Partial<Action>) => onChange({ ...action, ...patch });
   const params = (action.params || {}) as Record<string, unknown>;
@@ -570,6 +607,7 @@ function ActionFields({ action, protocol, firmware, onChange }: { action: Action
   </>;
 }
 
+/** 固件烧录动作字段：固件候选来自固件仓（支持 ${变量}），含擦除/校验/复位选项。 */
 function FlashFields({ action, firmware, onChange }: { action: Action; firmware: FirmwareInfo[]; onChange: (action: Action) => void }) {
   const options = (action.options || {}) as Record<string, unknown>;
   const update = (patch: Partial<Action>) => onChange({ ...action, ...patch });
@@ -596,11 +634,13 @@ function FlashFields({ action, firmware, onChange }: { action: Action; firmware:
   </>;
 }
 
+/** 动作追加器：选择动作类型后添加到当前测试项末尾。 */
 function ActionAdder({ onAdd }: { onAdd: (type: string) => void }) {
   const [type, setType] = useState("request");
   return <div className="pilot-action-adder"><select value={type} onChange={(event) => setType(event.target.value)}>{Object.entries(actionLabels).map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select><button className="pilot-secondary-button" onClick={() => onAdd(type)}>+ 添加动作</button></div>;
 }
 
+/** 嵌套节点追加器：向条件分支/循环体/并行分支内添加节点。 */
 function NestedNodeAdder({ onAdd }: { onAdd: (type: NodeType) => void }) {
   const [type, setType] = useState<NodeType>("test");
   return <span className="pilot-nested-adder"><select value={type} onChange={(event) => setType(event.target.value as NodeType)}>{Object.entries(nodeLabels).map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select><button className="pilot-secondary-button" onClick={() => onAdd(type)}>+ 添加</button></span>;
@@ -620,6 +660,7 @@ interface InspectorProps {
   onUpdateDefinition: (definition: FlowDefinition) => void;
 }
 
+/** 右侧节点检查器：按节点类型渲染属性表单（测试项动作列表、条件分支、并行分支、循环、子流程）。 */
 function Inspector({ definition, node, path, currentFlow, firmware, onUpdate, onDelete, onDuplicate, onAddNested, onEditSubflow, onUpdateDefinition }: InspectorProps) {
   const update = (patch: Partial<FlowNode>) => onUpdate((current) => ({ ...current, ...patch }));
   return <div className="pilot-inspector-content">
@@ -679,16 +720,19 @@ function Inspector({ definition, node, path, currentFlow, firmware, onUpdate, on
   </div>;
 }
 
+/** 挂载编辑器到指定容器（app.js 调用；重复调用复用同一 React root）。 */
 function mount(container: HTMLElement, options: EditorProps) {
   if (!editorRoot) editorRoot = createRoot(container);
   editorRoot.render(<FlowEditorApp {...options} />);
 }
 
+/** 外部（app.js）推送新草稿：已挂载则直接更新，未挂载则暂存待挂载时应用。 */
 function setDefinition(definition: FlowDefinition) {
   latestDefinition = definition;
   externalSetDefinition?.(definition);
 }
 
+/** 外部（app.js）推送固件仓清单，供 flash 动作的候选列表使用。 */
 function setFirmware(firmware: FirmwareInfo[]) {
   latestFirmware = firmware;
   externalSetFirmware?.(firmware);

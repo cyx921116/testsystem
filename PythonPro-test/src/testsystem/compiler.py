@@ -1,3 +1,11 @@
+"""v1（步骤式）流程编译器：校验 + 规范化低代码流程 JSON，并分派 v2 控制流流程。
+
+保存流程前必须通过编译：
+- 编译失败抛出 ``ScriptValidationError``，携带全部错误（前端逐条展示）；
+- 编译成功返回规范化后的定义（补默认值、裁剪空白），随后固化版本存入 scripts 表；
+- ``schema_version == 2`` 的流程转交 control_compiler（条件/循环/并行/子流程）。
+支持的动作类型、断言操作符、协议清单都在这里定义，是前后端共用的协议字典。
+"""
 from __future__ import annotations
 
 import re
@@ -5,6 +13,7 @@ from copy import deepcopy
 from typing import Any
 
 
+# 支持的通讯协议（与 protocols.py 的驱动一一对应）
 SUPPORTED_PROTOCOLS = {
     "simulator",
     "serial",
@@ -16,7 +25,9 @@ SUPPORTED_PROTOCOLS = {
     "mqtt",
     "jlink",
 }
+# 动作类型：收发/执行设备操作/变量赋值/断言/延时/固件烧录
 ACTION_TYPES = {"request", "send", "receive", "execute", "set", "assert", "sleep", "flash"}
+# 断言操作符（assert 动作的判定方式）
 ASSERT_OPERATORS = {
     "equals",
     "not_equals",
@@ -31,12 +42,17 @@ ASSERT_OPERATORS = {
     "truthy",
     "exists",
 }
+# 步骤/节点 ID：字母开头，≤40 位
 ID_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,39}$")
+# 变量名：标准标识符
 VARIABLE_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# 工站编号：与 MES 主数据 code 同规则
 STATION_CODE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
 class ScriptValidationError(ValueError):
+    """编译失败：errors 为逐条错误描述（含字段路径），整体消息用中文分号连接。"""
+
     def __init__(self, errors: list[str]):
         super().__init__("；".join(errors))
         self.errors = errors
@@ -60,6 +76,7 @@ def _normalize_max_retests(script: dict[str, Any], errors: list[str]) -> None:
     script["max_retests"] = value
 
 
+# 首次启动写入空库的演示流程：覆盖 SN 核验、版本检查、区间判定、自检四种典型场景
 DEFAULT_SCRIPT: dict[str, Any] = {
     "schema_version": 1,
     "name": "通用电子产品出厂测试",
@@ -119,11 +136,13 @@ DEFAULT_SCRIPT: dict[str, Any] = {
 
 
 def _number(value: Any, label: str, errors: list[str], minimum: int, maximum: int) -> None:
+    """数值范围校验（拒绝布尔），错误信息带字段路径。"""
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not minimum <= value <= maximum:
         errors.append(f"{label} 必须是 {minimum}~{maximum} 之间的数字")
 
 
 def _validate_action(action: Any, path: str, errors: list[str]) -> None:
+    """按动作类型逐项校验字段；path 为字段路径（如 steps[0].actions[1]），用于错误定位。"""
     if not isinstance(action, dict):
         errors.append(f"{path} 必须是对象")
         return
@@ -158,6 +177,7 @@ def _validate_action(action: Any, path: str, errors: list[str]) -> None:
         operator = action.get("operator")
         if operator not in ASSERT_OPERATORS:
             errors.append(f"{path}.operator 不支持：{operator!r}")
+        # truthy/exists 只需实际值，其余操作符必须有期望值
         if operator not in {"truthy", "exists"} and "expected" not in action:
             errors.append(f"{path}.expected 不能为空")
         if operator == "between":
@@ -178,6 +198,8 @@ def _validate_action(action: Any, path: str, errors: list[str]) -> None:
         if not isinstance(firmware, str) or not firmware.strip():
             errors.append(f"{path}.firmware 不能为空，需填写已登记的固件名称或 ID")
         elif "${" not in firmware:
+            # 固定固件名（非模板）在编译期就检查固件仓，尽早暴露配置错误；
+            # 含 ${} 的留到执行时按变量解析后再校验
             from .flasher import FlashError, find_firmware
 
             try:
@@ -200,6 +222,11 @@ def _validate_action(action: Any, path: str, errors: list[str]) -> None:
 
 
 def compile_script(source: dict[str, Any]) -> dict[str, Any]:
+    """编译入口：校验并规范化流程定义，失败抛 ScriptValidationError（含全部错误）。
+
+    v2 控制流流程分派给 control_compiler；v1 步骤式流程逐项校验步骤与动作，
+    通过后补默认值（超时/重试/失败策略）并裁剪空白，返回可固化的定义。
+    """
     if not isinstance(source, dict):
         raise ScriptValidationError(["脚本根节点必须是 JSON 对象"])
     if source.get("schema_version") == 2:
@@ -262,6 +289,7 @@ def compile_script(source: dict[str, Any]) -> dict[str, Any]:
     if errors:
         raise ScriptValidationError(errors)
 
+    # 规范化：裁剪空白、补默认值，保证执行端读到的字段齐全
     script["schema_version"] = 1
     script["name"] = str(script["name"]).strip()
     script["product_model"] = str(script["product_model"]).strip()

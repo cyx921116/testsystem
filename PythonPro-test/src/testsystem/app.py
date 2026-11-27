@@ -1,3 +1,17 @@
+"""FastAPI 应用：全部 HTTP API 与静态页面托管。
+
+路由分组：
+- /api/auth/*        登录、会话与账号管理（auth.py 提供路由，此处统一鉴权）
+- /api/scripts*      测试流程的编译、保存、停用（保存即固化版本）
+- /api/protocols*    通讯协议配置与连接测试
+- /api/firmware*     固件仓登记/上传/校验；/api/flashers 烧录后端
+- /api/settings      工位策略；/api/mes/* MES 配置、报文预览与主数据同步维护
+- /api/test-runs*    扫码预检、开始测试、运行状态轮询（生产执行核心）
+- /api/reports*      报告查询、下载、MES 上传与上传日志
+
+鉴权模型：除健康检查与登录外的 /api 请求都经过 authenticate_request 中间件；
+操作工只放行生产必需的只读接口与扫码/开始测试，其余写操作要求管理员。
+"""
 from __future__ import annotations
 
 import json
@@ -41,6 +55,7 @@ auth_service = AuthService(database)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """应用生命周期：启动时初始化数据库（建表/迁移/默认数据）并收尾中断的运行。"""
     database.initialize()
     database.recover_interrupted_runs()
     yield
@@ -57,6 +72,7 @@ app.include_router(create_auth_router(auth_service))
 
 
 def _operator_allowed(method: str, path: str) -> bool:
+    """操作工权限白名单：生产必需的只读接口 + 扫码/开始测试；其余一律要求管理员。"""
     if path in {"/api/auth/me", "/api/auth/password"}:
         return True
     if method == "POST" and path in {"/api/test-runs", "/api/test-runs/scan"}:
@@ -79,6 +95,7 @@ def _operator_allowed(method: str, path: str) -> bool:
 
 @app.middleware("http")
 async def authenticate_request(request: Request, call_next: Any) -> Any:
+    """认证与授权中间件：解析会话 Cookie，未登录 401，操作工越权 403。"""
     path = request.url.path
     if not (path == "/api" or path.startswith("/api/")) or path in {"/api/health", "/api/auth/login", "/api/auth/logout"}:
         return await call_next(request)
@@ -92,16 +109,22 @@ async def authenticate_request(request: Request, call_next: Any) -> Any:
 
 
 class ScriptPayload(BaseModel):
+    """流程保存/校验请求体：definition 为低代码流程 JSON（v1 步骤式或 v2 控制流）。"""
+
     definition: dict[str, Any]
 
 
 class SNPayload(BaseModel):
+    """扫码预检请求体：station 为执行台选中的测试工站（缺省回退终端工站）。"""
+
     sn: str = Field(min_length=1, max_length=128)
     script_id: int
     station: str | None = Field(default=None, max_length=64)
 
 
 class StartPayload(SNPayload):
+    """开始测试请求体；operator 字段仅为兼容保留，实际取登录用户名（防伪造）。"""
+
     operator: str | None = Field(default=None, max_length=64)
 
 
@@ -143,6 +166,7 @@ class MasterItemPayload(BaseModel):
 
 
 def _script(row: sqlite3.Row) -> dict[str, Any]:
+    """scripts 行 → API 输出：解析定义 JSON，附版本与启停状态。"""
     return {
         "id": row["id"],
         "name": row["name"],
@@ -186,6 +210,7 @@ def _validate_script_binding(definition: dict[str, Any], exclude_id: int | None 
 
 
 def _get_script(script_id: int, enabled_only: bool = True) -> sqlite3.Row:
+    """取流程行；默认只取启用中的（停用流程不可再执行，历史报告不受影响）。"""
     row = database.one("SELECT * FROM scripts WHERE id = ?", (script_id,))
     if row is None or (enabled_only and not row["enabled"]):
         raise HTTPException(404, "测试脚本不存在或已停用")
@@ -193,6 +218,7 @@ def _get_script(script_id: int, enabled_only: bool = True) -> sqlite3.Row:
 
 
 def _validate_sn(sn: str) -> str:
+    """按工位策略的 SN 正则做完整匹配校验；不合法返回 422，正则配置失效返回 500。"""
     sn = sn.strip()
     pattern = database.setting("sn_pattern", DEFAULT_SETTINGS["sn_pattern"])
     try:
@@ -224,6 +250,7 @@ def _effective_max_retests(script: sqlite3.Row) -> int:
 
 
 def _run(run_id: str) -> dict[str, Any]:
+    """组装运行详情：运行状态 + 逐项结果 + 控制流轨迹 + 烧录记录 + 关联报告，供前端轮询。"""
     row = database.one("SELECT * FROM test_runs WHERE id = ?", (run_id,))
     if row is None:
         raise HTTPException(404, "测试运行记录不存在")
@@ -298,6 +325,7 @@ def _run(run_id: str) -> dict[str, Any]:
 
 
 def _report_list_item(row: sqlite3.Row) -> dict[str, Any]:
+    """reports 行 → 列表项输出（不含完整 report_json，详情走 /api/reports/{id}）。"""
     return {
         "id": row["id"],
         "report_no": row["report_no"],
@@ -320,6 +348,7 @@ def _report_list_item(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def _validate_mes_config(config: dict[str, Any]) -> None:
+    """保存 MES 配置前的整体校验：地址/方法/超时/报文模式/主数据段逐项检查。"""
     if not str(config.get("endpoint", "")).startswith(("http://", "https://")):
         raise HTTPException(422, "MES 地址必须是 HTTP/HTTPS URL")
     if str(config.get("method", "POST")).upper() not in {"POST", "PUT", "PATCH"}:
@@ -363,11 +392,13 @@ def _validate_mes_config(config: dict[str, Any]) -> None:
 
 @app.get("/api/health")
 def health() -> dict[str, Any]:
+    """健康检查（免登录）：服务状态、当前时间与终端工站。"""
     return {"status": "ok", "time": utc_now(), "station": database.setting("station_id")}
 
 
 @app.get("/api/dashboard")
 def dashboard() -> dict[str, Any]:
+    """生产页指标卡与最近报告：今日/累计测试、通过率、活动运行。"""
     totals = database.one(
         "SELECT COUNT(*) AS total, SUM(status = 'PASS') AS passed, SUM(status = 'FAIL') AS failed "
         "FROM reports"
@@ -393,11 +424,13 @@ def dashboard() -> dict[str, Any]:
 
 @app.get("/api/scripts")
 def list_scripts() -> list[dict[str, Any]]:
+    """流程列表（启用在前、按更新时间倒序），执行台与流程库共用。"""
     return [_script(row) for row in database.all("SELECT * FROM scripts ORDER BY enabled DESC, updated_at DESC")]
 
 
 @app.post("/api/scripts", status_code=201)
 def create_script(payload: ScriptPayload) -> dict[str, Any]:
+    """新建流程：先编译校验，再校验产品/工站绑定（主数据非空时必须在主数据内）。"""
     try:
         definition = compile_script(payload.definition)
     except ScriptValidationError as exc:
@@ -417,6 +450,7 @@ def create_script(payload: ScriptPayload) -> dict[str, Any]:
 
 @app.post("/api/scripts/validate")
 def validate_script(payload: ScriptPayload) -> dict[str, Any]:
+    """仅编译校验不保存：返回是否通过、错误列表或规范化后的定义。"""
     try:
         compiled = compile_script(payload.definition)
     except ScriptValidationError as exc:
@@ -426,6 +460,7 @@ def validate_script(payload: ScriptPayload) -> dict[str, Any]:
 
 @app.put("/api/scripts/{script_id}")
 def update_script(script_id: int, payload: ScriptPayload) -> dict[str, Any]:
+    """更新流程：版本号 +1 并重新启用；历史报告仍引用各自的脚本快照。"""
     current = _get_script(script_id, enabled_only=False)
     try:
         definition = compile_script(payload.definition)
@@ -449,6 +484,7 @@ def update_script(script_id: int, payload: ScriptPayload) -> dict[str, Any]:
 
 @app.delete("/api/scripts/{script_id}")
 def disable_script(script_id: int) -> dict[str, str]:
+    """停用流程（软删除）：执行台不再索引，历史报告保留快照。"""
     _get_script(script_id)
     database.execute("UPDATE scripts SET enabled = 0, updated_at = ? WHERE id = ?", (utc_now(), script_id))
     return {"message": "脚本已停用，历史报告仍保留原脚本快照"}
@@ -456,12 +492,14 @@ def disable_script(script_id: int) -> dict[str, str]:
 
 @app.get("/api/protocols")
 def get_protocols() -> list[dict[str, Any]]:
+    """协议目录（字段定义 + 驱动可用性）并附上已保存的连接配置。"""
     configs = {row["name"]: json.loads(row["config_json"]) for row in database.all("SELECT * FROM protocol_configs")}
     return [{**item, "config": configs.get(item["name"], {})} for item in protocol_catalog()]
 
 
 @app.put("/api/protocols/{name}")
 def save_protocol(name: str, payload: ConfigPayload) -> dict[str, Any]:
+    """保存协议连接配置（先过编解码预检）。"""
     if name not in SUPPORTED_PROTOCOLS:
         raise HTTPException(404, "通讯协议不存在")
     try:
@@ -478,6 +516,7 @@ def save_protocol(name: str, payload: ConfigPayload) -> dict[str, Any]:
 
 @app.post("/api/protocols/{name}/test")
 def test_protocol(name: str, payload: ConfigPayload) -> dict[str, Any]:
+    """测试连接：用请求体中的配置即时建立连接验证（不要求先保存）。"""
     if name not in SUPPORTED_PROTOCOLS:
         raise HTTPException(404, "通讯协议不存在")
     try:
@@ -498,11 +537,13 @@ def test_protocol(name: str, payload: ConfigPayload) -> dict[str, Any]:
 
 @app.get("/api/firmware")
 def list_firmware() -> list[dict[str, Any]]:
+    """固件仓清单（含版本、适用型号、SHA-256 校验和）。"""
     return load_firmware_index()
 
 
 @app.post("/api/firmware", status_code=201)
 def register_firmware_api(payload: FirmwareRegisterPayload) -> dict[str, Any]:
+    """按工作站本地路径登记固件入仓（复制进固件仓并记录校验和）。"""
     try:
         return register_firmware(payload.source, payload.version, payload.product_model, payload.description)
     except FlashError as exc:
@@ -540,6 +581,7 @@ async def upload_firmware_api(
 
 @app.post("/api/firmware/{name}/verify")
 def verify_firmware(name: str) -> dict[str, Any]:
+    """校验固件：文件存在且 SHA-256 与登记一致（防烧入被替换的文件）。"""
     try:
         entry = find_firmware(name)
     except FlashError as exc:
@@ -549,16 +591,19 @@ def verify_firmware(name: str) -> dict[str, Any]:
 
 @app.get("/api/flashers")
 def get_flashers() -> list[dict[str, Any]]:
+    """烧录后端目录（名称、描述、驱动可用性）。"""
     return flasher_catalog()
 
 
 @app.get("/api/flasher/config")
 def get_flasher_config() -> dict[str, Any]:
+    """读取当前烧录后端配置。"""
     return database.setting("flasher", DEFAULT_FLASHER_CONFIG)
 
 
 @app.put("/api/flasher/config")
 def save_flasher_config(payload: FlasherConfigPayload) -> dict[str, Any]:
+    """保存烧录后端配置（后端类型必须在注册表内）。"""
     if payload.backend not in FLASHER_CLASSES:
         raise HTTPException(422, f"不支持的烧录后端：{payload.backend}")
     config = {"backend": payload.backend, "config": payload.config}
@@ -568,6 +613,7 @@ def save_flasher_config(payload: FlasherConfigPayload) -> dict[str, Any]:
 
 @app.post("/api/flasher/test")
 def test_flasher(payload: FlasherConfigPayload) -> dict[str, Any]:
+    """探测烧录后端可用性（驱动是否安装、命令模板是否配置等）。"""
     if payload.backend not in FLASHER_CLASSES:
         raise HTTPException(422, f"不支持的烧录后端：{payload.backend}")
     flasher = create_flasher(payload.backend, payload.config)
@@ -582,11 +628,13 @@ def test_flasher(payload: FlasherConfigPayload) -> dict[str, Any]:
 
 @app.get("/api/settings")
 def get_settings() -> dict[str, Any]:
+    """读取工位策略（终端工站、默认操作员、SN 正则、自动上传、复测上限）。"""
     return {key: database.setting(key, value) for key, value in DEFAULT_SETTINGS.items()}
 
 
 @app.put("/api/settings")
 def save_settings(payload: SettingsPayload) -> dict[str, Any]:
+    """保存工位策略（仅管理员）：SN 正则会先做编译校验。"""
     try:
         re.compile(payload.sn_pattern)
     except re.error as exc:
@@ -598,11 +646,13 @@ def save_settings(payload: SettingsPayload) -> dict[str, Any]:
 
 @app.get("/api/mes/config")
 def get_mes_config() -> dict[str, Any]:
+    """读取 MES 配置（报告上传 + master_data 主数据段）。"""
     return database.setting("mes", DEFAULT_MES_CONFIG)
 
 
 @app.put("/api/mes/config")
 def save_mes_config(payload: ConfigPayload) -> dict[str, Any]:
+    """保存 MES 配置（先整体校验，含 master_data 段）。"""
     _validate_mes_config(payload.config)
     database.save_setting("mes", payload.config)
     return payload.config
@@ -610,6 +660,7 @@ def save_mes_config(payload: ConfigPayload) -> dict[str, Any]:
 
 @app.get("/api/mes/preview")
 def preview_mes_payload() -> dict[str, Any]:
+    """报文预览：用最新报告（没有则用内置示例）渲染实际发送结构，不发起网络请求。"""
     row = database.one("SELECT report_json FROM reports ORDER BY finished_at DESC LIMIT 1")
     if row:
         report = json.loads(row["report_json"])
@@ -636,6 +687,7 @@ def preview_mes_payload() -> dict[str, Any]:
 
 
 def _master_error(exc: MESMasterError) -> HTTPException:
+    """主数据异常 → HTTP 状态码映射：同步失败 502、不存在 404、冲突 409、参数 422。"""
     if isinstance(exc, MESSyncError):
         return HTTPException(502, str(exc))
     if isinstance(exc, MESMasterMissingError):
@@ -647,16 +699,19 @@ def _master_error(exc: MESMasterError) -> HTTPException:
 
 @app.get("/api/mes/products")
 def list_master_products(include_disabled: bool = True) -> dict[str, Any]:
+    """产品主数据列表（操作工只读，执行台/流程编排的产品下拉数据源）。"""
     return MESMasterData(database).list_items("products", include_disabled)
 
 
 @app.get("/api/mes/stations")
 def list_master_stations(include_disabled: bool = True) -> dict[str, Any]:
+    """工站主数据列表（操作工只读，执行台工站与工位策略下拉数据源）。"""
     return MESMasterData(database).list_items("stations", include_disabled)
 
 
 @app.post("/api/mes/sync")
 def sync_master_data(payload: MasterSyncPayload) -> dict[str, Any]:
+    """手动同步主数据（管理员）：从 MES/模拟器拉取并 upsert，返回新增/更新/停用统计。"""
     try:
         return MESMasterData(database).sync(payload.target)
     except MESMasterError as exc:
@@ -665,6 +720,7 @@ def sync_master_data(payload: MasterSyncPayload) -> dict[str, Any]:
 
 @app.post("/api/mes/products", status_code=201)
 def create_master_product(payload: MasterItemPayload) -> dict[str, Any]:
+    """添加本地产品（管理员）；编号冲突返回 409。"""
     try:
         item = MESMasterData(database).create_item("products", payload.model_dump())
     except MESMasterError as exc:
@@ -674,6 +730,7 @@ def create_master_product(payload: MasterItemPayload) -> dict[str, Any]:
 
 @app.put("/api/mes/products/{code}")
 def update_master_product(code: str, payload: MasterItemPayload) -> dict[str, Any]:
+    """更新产品：本地行可改名称/规格，MES 行仅支持启用/停用。"""
     try:
         item = MESMasterData(database).update_item("products", code, payload.model_dump())
     except MESMasterError as exc:
@@ -683,6 +740,7 @@ def update_master_product(code: str, payload: MasterItemPayload) -> dict[str, An
 
 @app.delete("/api/mes/products/{code}")
 def delete_master_product(code: str) -> dict[str, str]:
+    """删除本地产品；MES 同步行返回 409。"""
     try:
         MESMasterData(database).delete_item("products", code)
     except MESMasterError as exc:
@@ -692,6 +750,7 @@ def delete_master_product(code: str) -> dict[str, str]:
 
 @app.post("/api/mes/stations", status_code=201)
 def create_master_station(payload: MasterItemPayload) -> dict[str, Any]:
+    """添加本地工站（管理员）；编号冲突返回 409。"""
     try:
         item = MESMasterData(database).create_item("stations", payload.model_dump())
     except MESMasterError as exc:
@@ -701,6 +760,7 @@ def create_master_station(payload: MasterItemPayload) -> dict[str, Any]:
 
 @app.put("/api/mes/stations/{code}")
 def update_master_station(code: str, payload: MasterItemPayload) -> dict[str, Any]:
+    """更新工站：本地行可改名称/产线/类型，MES 行仅支持启用/停用。"""
     try:
         item = MESMasterData(database).update_item("stations", code, payload.model_dump())
     except MESMasterError as exc:
@@ -710,6 +770,7 @@ def update_master_station(code: str, payload: MasterItemPayload) -> dict[str, An
 
 @app.delete("/api/mes/stations/{code}")
 def delete_master_station(code: str) -> dict[str, str]:
+    """删除本地工站；MES 同步行返回 409。"""
     try:
         MESMasterData(database).delete_item("stations", code)
     except MESMasterError as exc:
@@ -778,6 +839,11 @@ def scan_sn(payload: SNPayload) -> dict[str, Any]:
 
 @app.post("/api/test-runs", status_code=201)
 def start_test(payload: StartPayload, request: Request) -> dict[str, Any]:
+    """开始测试：在事务内复检所有限制后创建 RUNNING 运行并提交后台执行器。
+
+    执行工站取执行台选中的测试工站（缺省回退终端工站）；流程绑定工站与所选
+    工站不一致返回 409。操作员取登录用户名，忽略客户端伪造的 operator 字段。
+    """
     sn = _validate_sn(payload.sn)
     script = _get_script(payload.script_id)
     station = _effective_station(payload.station)
@@ -842,12 +908,14 @@ def start_test(payload: StartPayload, request: Request) -> dict[str, Any]:
 
 @app.get("/api/test-runs/active")
 def active_run() -> dict[str, Any] | None:
+    """当前活动运行（页面刷新后恢复执行台状态用）；无则返回 null。"""
     row = database.one("SELECT id FROM test_runs WHERE status = 'RUNNING' ORDER BY started_at DESC LIMIT 1")
     return _run(row["id"]) if row else None
 
 
 @app.get("/api/test-runs/{run_id}")
 def get_run(run_id: str) -> dict[str, Any]:
+    """运行详情（状态 + 逐项结果 + 控制流 + 烧录记录），前端执行中每 450ms 轮询一次。"""
     return _run(run_id)
 
 
@@ -859,6 +927,7 @@ def list_reports(
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
+    """报告列表：SN 模糊搜索 + 结果/MES 状态筛选，按完成时间倒序分页。"""
     conditions: list[str] = []
     params: list[Any] = []
     if sn.strip():
@@ -885,6 +954,7 @@ def list_reports(
 
 @app.get("/api/reports/{report_id}")
 def get_report(report_id: str) -> dict[str, Any]:
+    """报告详情：完整报告 JSON（含脚本快照、测试项、控制流、烧录记录）+ MES 状态。"""
     row = database.one("SELECT * FROM reports WHERE id = ?", (report_id,))
     if row is None:
         raise HTTPException(404, "报告不存在")
@@ -895,6 +965,7 @@ def get_report(report_id: str) -> dict[str, Any]:
 
 @app.get("/api/reports/{report_id}/download")
 def download_report(report_id: str) -> JSONResponse:
+    """下载报告 JSON 文件（文件名即报告编号）。"""
     row = database.one("SELECT report_no, report_json FROM reports WHERE id = ?", (report_id,))
     if row is None:
         raise HTTPException(404, "报告不存在")
@@ -906,6 +977,7 @@ def download_report(report_id: str) -> JSONResponse:
 
 @app.get("/api/reports/{report_id}/upload-logs")
 def get_upload_logs(report_id: str) -> list[dict[str, Any]]:
+    """报告的 MES 上传日志（每次尝试的请求与响应留痕）。"""
     rows = database.all(
         "SELECT * FROM mes_upload_logs WHERE report_id = ? ORDER BY id DESC", (report_id,)
     )
@@ -923,6 +995,7 @@ def get_upload_logs(report_id: str) -> list[dict[str, Any]]:
 
 @app.post("/api/reports/{report_id}/upload")
 def upload_report(report_id: str) -> dict[str, Any]:
+    """手动上传/重试上传报告到 MES（管理员）；失败返回 502 并保留响应原文。"""
     try:
         return MESUploader(database).upload(report_id)
     except MESUploadError as exc:

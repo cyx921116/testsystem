@@ -1,3 +1,15 @@
+"""v2 控制流流程编译器：校验含条件/循环/并行/子流程的测试流程定义。
+
+节点类型（``NODE_TYPES``）：
+- test      测试项（协议 + 动作序列，与 v1 步骤同构）
+- condition 条件分支（condition 为断言，then/else 为子节点序列）
+- parallel  并行分支（2~8 个分支，max_workers 控制并发度）
+- loop      循环（count 固定次数 / while 条件循环，均有 max_iterations 保险丝）
+- subflow   子流程引用（inputs 传参，定义在脚本级 subflows 字典中）
+
+编译期保证：节点 ID 全局唯一、嵌套 ≤6 层、节点总数 ≤500、子流程引用存在且无循环调用、
+整个流程至少含一个 test 节点。动作与断言字段复用 v1 编译器的校验规则。
+"""
 from __future__ import annotations
 
 from copy import deepcopy
@@ -15,10 +27,11 @@ from .compiler import (
 
 
 NODE_TYPES = {"test", "condition", "parallel", "loop", "subflow"}
-ROOT_FLOW = "__main__"
+ROOT_FLOW = "__main__"  # 子流程调用图中主流程的占位名
 
 
 def _register_id(node: dict[str, Any], path: str, errors: list[str], ids: set[str]) -> None:
+    """登记节点 ID（全局唯一，含分支与嵌套节点），并校验名称与失败策略、补默认值。"""
     node_id = node.get("id")
     if not isinstance(node_id, str) or not ID_PATTERN.fullmatch(node_id):
         errors.append(f"{path}.id 需以字母开头，仅含字母、数字、下划线或连字符")
@@ -34,6 +47,7 @@ def _register_id(node: dict[str, Any], path: str, errors: list[str], ids: set[st
 
 
 def _condition(value: Any, path: str, errors: list[str]) -> None:
+    """校验条件表达式：条件本质是一个 assert 动作（actual/operator/expected）。"""
     if not isinstance(value, dict):
         errors.append(f"{path} 必须是断言对象")
         return
@@ -49,6 +63,10 @@ def _sequence(
     depth: int,
     counter: list[int],
 ) -> None:
+    """递归校验一段节点序列（主流程、分支、循环体、子流程体共用）。
+
+    depth 限制嵌套层级（≤6），counter 统计节点总数（≤500），防止失控的深层嵌套拖垮执行器。
+    """
     if not isinstance(steps, list):
         errors.append(f"{path} 必须是节点数组")
         return
@@ -117,6 +135,7 @@ def _sequence(
                 _number(node.get("count", 1), f"{node_path}.count", errors, 1, 100)
             else:
                 _condition(node.get("condition"), f"{node_path}.condition", errors)
+            # max_iterations 是 while 循环的保险丝：条件恒真时也能终止
             _number(node.get("max_iterations", 20), f"{node_path}.max_iterations", errors, 1, 100)
             if not isinstance(node.get("break_on_fail", True), bool):
                 errors.append(f"{node_path}.break_on_fail 必须是布尔值")
@@ -133,6 +152,7 @@ def _sequence(
 
 
 def _subflow_graph(steps: Any, subflows: dict[str, Any]) -> dict[str, set[str]]:
+    """构建子流程调用图：{调用方: {被调用的子流程名}}，主流程记为 ROOT_FLOW。"""
     graph: dict[str, set[str]] = {ROOT_FLOW: set()}
 
     def visit(nodes: Any, owner: str) -> None:
@@ -165,6 +185,7 @@ def _subflow_graph(steps: Any, subflows: dict[str, Any]) -> dict[str, set[str]]:
 def _check_subflow_calls(
     steps: Any, subflows: dict[str, Any], errors: list[str]
 ) -> None:
+    """基于调用图检查：引用的子流程必须存在；深度优先检测循环调用与调用层级（≤6）。"""
     graph = _subflow_graph(steps, subflows)
     for name, targets in graph.items():
         for target in targets:
@@ -195,6 +216,7 @@ def _check_subflow_calls(
 
 
 def _contains_test(steps: Any) -> bool:
+    """递归判断节点序列中是否包含 test 节点（纯控制节点组成的流程没有可执行测试项）。"""
     if not isinstance(steps, list):
         return False
     for node in steps:
@@ -216,6 +238,7 @@ def _contains_test(steps: Any) -> bool:
 
 
 def compile_control_script(source: dict[str, Any]) -> dict[str, Any]:
+    """编译 v2 控制流流程：校验元信息、递归校验节点、检查子流程调用、确认含测试节点。"""
     script = deepcopy(source)
     errors: list[str] = []
     if not str(script.get("name", "")).strip():

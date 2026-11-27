@@ -1,8 +1,23 @@
 "use strict";
 
+/**
+ * 前端单页应用（原生 JS，无框架）：登录、生产测试执行台、流程编排、通讯配置、
+ * 固件烧录、MES 集成、报告中心、账号权限八个页面。
+ *
+ * 结构约定：
+ * - state 为唯一全局状态；render* 函数把 state 渲染到 DOM，load* 函数拉取后端数据；
+ * - 所有后端请求经 api() 封装（JSON、错误消息提取、401 统一跳登录）；
+ * - 图形流程编辑画布由 flow-editor.js（React 构建产物，源码在 frontend/）提供，
+ *   通过 window.PilotFlowEditor 挂载，与步骤列表编辑器共享同一份草稿 state.draft。
+ */
+
+/** querySelector / querySelectorAll 的简写。 */
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
+/** 深拷贝（流程草稿编辑等场景避免共享引用）。 */
 const clone = (value) => JSON.parse(JSON.stringify(value));
+
+/** 全局状态：登录用户、流程列表与执行台选中项、编辑草稿、运行/轮询、各配置页数据。 */
 const state = {
   user: null,
   users: [],
@@ -32,6 +47,7 @@ const state = {
   drag: null,
 };
 
+/** 页面元信息：hash 路由 → 顶栏标题/副标题。 */
 const pageMeta = {
   production: ["生产测试", "扫描产品 SN，执行测试并绑定唯一报告"],
   scripts: ["流程编排", "低代码编辑测试逻辑，后端统一编译执行"],
@@ -42,59 +58,74 @@ const pageMeta = {
   users: ["账号权限", "管理登录账号、角色和启用状态"],
 };
 
+/** 协议缩写图标（通讯配置页左侧导航）。 */
 const protocolSymbols = {
   simulator: "SIM", serial: "COM", can: "CAN", tcp: "TCP", modbus: "MB",
   bluetooth: "BLE", wifi: "WiFi", mqtt: "MQTT", jlink: "JLK",
 };
 
+/** 动作类型 → 中文名（流程编排编辑器）。 */
 const actionLabels = {
   request: "发送并等待响应", send: "仅发送", receive: "等待接收", execute: "设备操作",
   set: "设置变量", assert: "结果断言", sleep: "延时等待", flash: "固件烧录",
 };
 
+/** 动作类型 → 节点角标缩写（画布节点上的徽标）。 */
 const actionSymbols = {
   request: "REQ", send: "TX", receive: "RX", execute: "EXE",
   set: "SET", assert: "IF", sleep: "WAIT", flash: "FLASH",
 };
 
+/** 断言操作符 → 中文名（断言动作的下拉选项）。 */
 const operatorLabels = {
   equals: "等于", not_equals: "不等于", contains: "包含", not_contains: "不包含",
   regex: "正则匹配", gt: "大于", gte: "大于等于", lt: "小于", lte: "小于等于",
   between: "数值区间", truthy: "为真", exists: "存在且非空",
 };
 
+/** HTML 转义：所有拼接进 innerHTML 的动态值必须经此处理，防 XSS。 */
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>'"]/g, (char) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;",
   })[char]);
 }
 
+/** 展示值格式化：空值显示为 —，对象转 JSON 字符串。 */
 function displayValue(value) {
   if (value === null || value === undefined || value === "") return "—";
   if (typeof value === "object") return JSON.stringify(value);
   return String(value);
 }
 
+/** ISO 时间戳 → 本地时间字符串；非法值原样返回。 */
 function formatTime(value) {
   if (!value) return "—";
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString("zh-CN", { hour12: false });
 }
 
+/** 毫秒时长 → “123 ms” / “1.23 s”。 */
 function formatDuration(value) {
   const ms = Number(value || 0);
   return ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(2)} s`;
 }
 
+/** 状态徽标 HTML（PASS/FAIL/RUNNING/PENDING 等着色由 styles.css 的 badge-* 决定）。 */
 function statusBadge(status) {
   const value = status || "PENDING";
   return `<span class="badge badge-${escapeHtml(value.toLowerCase())}">${escapeHtml(value)}</span>`;
 }
 
+/** MES 上传状态 → 中文文案。 */
 function mesStatusText(status) {
   return { PENDING: "待上传", UPLOADING: "上传中", SUCCESS: "上传成功", FAILED: "上传失败" }[status] || "未生成";
 }
 
+/**
+ * 后端请求封装：自动 JSON 序列化请求体、解析响应；
+ * 非 2xx 时提取 FastAPI detail/编译错误并抛出带可读消息的 Error（error.status 附状态码）；
+ * 401 时统一跳转登录页（登录/会话探测接口除外）。
+ */
 async function api(url, options = {}) {
   const request = { ...options, headers: { ...(options.headers || {}) } };
   if (request.body && typeof request.body !== "string" && !(request.body instanceof Blob)) {
@@ -121,6 +152,7 @@ async function api(url, options = {}) {
   return payload;
 }
 
+/** 右下角浮动提示，4.2 秒后自动消失；type 为 "success"/"error"/""。 */
 function toast(message, type = "") {
   const element = document.createElement("div");
   element.className = `toast ${type}`;
@@ -129,10 +161,12 @@ function toast(message, type = "") {
   setTimeout(() => element.remove(), 4200);
 }
 
+/** 解析 JSON 输入框，失败时抛出带字段名的可读错误。 */
 function parseJsonField(value, label) {
   try { return JSON.parse(value); } catch (error) { throw new Error(`${label} JSON 格式错误：${error.message}`); }
 }
 
+/** 智能取值：数字/true/false/null 文本转对应类型，其余保持字符串（编辑器输入用）。 */
 function parseSmartValue(value) {
   if (typeof value !== "string") return value;
   const text = value.trim();
@@ -143,6 +177,10 @@ function parseSmartValue(value) {
   return value;
 }
 
+/**
+ * 页面切换（hash 路由）：操作工访问管理页时回落到生产页；
+ * 每次切换按需加载该页数据（生产页同时刷新流程与主数据，保证编排页改动即时生效）。
+ */
 function navigate(page) {
   if (!pageMeta[page]) return;
   if (state.user?.role !== "admin" && ["scripts", "protocols", "firmware", "mes", "users"].includes(page)) page = "production";
@@ -161,6 +199,7 @@ function navigate(page) {
   if (page === "users") loadUsers();
 }
 
+/** 加载仪表盘：四张指标卡 + 最近测试报告表。 */
 async function loadDashboard() {
   try {
     const data = await api("/api/dashboard");
@@ -189,11 +228,16 @@ function productionCandidates() {
   return state.scripts.filter((script) => script.enabled);
 }
 
+/** 按（产品, 工站）精确匹配启用流程：执行台“带出测试流程”的匹配规则。 */
 function matchingScripts() {
   return productionCandidates().filter((script) =>
     script.product_model === state.selectedProduct && (script.station_code || "") === (state.selectedStation || ""));
 }
 
+/**
+ * 加载流程列表并确定执行台默认选中项：
+ * 优先保持当前选中，其次选绑定终端工站的流程，最后取第一个启用流程。
+ */
 async function loadScripts() {
   state.scripts = await api("/api/scripts");
   const candidates = productionCandidates();
@@ -211,6 +255,7 @@ async function loadScripts() {
   renderProductionPicker();
 }
 
+/** 产品/工站变化后重选匹配流程（无匹配则清空），并刷新执行台。 */
 function resolveProductionScript() {
   const matches = matchingScripts();
   if (!matches.some((item) => item.id === state.selectedScriptId)) {
@@ -307,6 +352,7 @@ function currentProductionScript() {
   return state.scripts.find((script) => script.id === state.selectedScriptId) || null;
 }
 
+/** 渲染执行台选中流程的测试项预览（PENDING 状态）。 */
 function renderTestItems(items) {
   $("#test-items").innerHTML = items.length ? items.map((item, index) => {
     const status = item.status || "PENDING";
@@ -322,6 +368,7 @@ function renderTestItems(items) {
   }).join("") : '<tr><td colspan="6" class="empty-row">请选择测试流程</td></tr>';
 }
 
+/** 展开流程定义中的全部测试节点（含条件/并行/循环/子流程），用于预览与计数。 */
 function previewTestNodes(definition) {
   const subflows = definition.subflows || {};
   function collect(nodes, visited = new Set()) {
@@ -341,6 +388,10 @@ function previewTestNodes(definition) {
   return collect(definition.steps);
 }
 
+/**
+ * 未运行时的执行台预览：按选中流程渲染 PENDING 测试项与右侧产品信息；
+ * 有正在进行的运行时直接返回（运行状态由 renderRun 负责）。
+ */
 function renderPreview() {
   const script = currentProductionScript();
   if (!script || state.run) return;
@@ -365,6 +416,7 @@ function renderPreview() {
   $("#run-mes-state").innerHTML = "<span>MES 状态</span><strong>等待生成报告</strong>";
 }
 
+/** 清空/下一台：停止轮询、清空 SN 与运行状态、解锁选择器并聚焦扫码框。 */
 function resetConsole() {
   clearTimeout(state.pollTimer);
   state.run = null;
@@ -379,6 +431,7 @@ function resetConsole() {
   $("#sn-input").focus();
 }
 
+/** 扫码预检：把 SN、流程与所选测试工站提交后端，展示能否开始及原因；有活动运行时恢复该运行。 */
 async function scanSn() {
   const sn = $("#sn-input").value.trim();
   const script = currentProductionScript();
@@ -403,6 +456,7 @@ async function scanSn() {
   }
 }
 
+/** 开始测试：创建运行（携带所选工站）、锁定选择器并开始轮询。 */
 async function startTest() {
   if (!state.scan?.can_start || state.run?.status === "RUNNING") return;
   const script = currentProductionScript();
@@ -424,6 +478,7 @@ async function startTest() {
   }
 }
 
+/** 把后端运行状态完整渲染到页面：进度条、逐项结果、右侧面板、MES 状态与报告入口。 */
 function renderRun() {
   const run = state.run;
   if (!run) return;
@@ -462,6 +517,7 @@ function renderRun() {
     : "<span>MES 状态</span><strong>报告生成中</strong>";
 }
 
+/** 轮询运行状态：执行中每 450ms 一次；完成时提示结果并刷新仪表盘；失败退避到 1500ms。 */
 async function pollRun() {
   if (!state.run || state.run.status !== "RUNNING") return;
   try {
@@ -481,6 +537,7 @@ async function pollRun() {
   }
 }
 
+/** 恢复运行：页面刷新或扫码发现活动运行时，重建选中项与轮询。 */
 async function resumeRun(runId) {
   clearTimeout(state.pollTimer);
   state.run = await api(`/api/test-runs/${runId}`);
@@ -496,6 +553,7 @@ async function resumeRun(runId) {
   if (state.run.status === "RUNNING") pollRun();
 }
 
+/** 各动作类型的默认参数（编辑器新建动作时使用）。 */
 function defaultAction(type = "request") {
   const defaults = {
     request: { type, data: "AT+SELFTEST?", save_as: "response" },
@@ -510,6 +568,7 @@ function defaultAction(type = "request") {
   return clone(defaults[type] || defaults.request);
 }
 
+/** 新建测试项模板：仿真器协议 + 请求/断言两个默认动作。 */
 function newStep(index = 0) {
   return {
     id: `item_${Date.now().toString(36).slice(-5)}_${index + 1}`,
@@ -518,14 +577,17 @@ function newStep(index = 0) {
   };
 }
 
+/** 生成 <option> 列表（编辑器下拉用）。 */
 function optionTags(options, selected) {
   return Object.entries(options).map(([value, label]) => `<option value="${escapeHtml(value)}" ${value === selected ? "selected" : ""}>${escapeHtml(label)}</option>`).join("");
 }
 
+/** 动作字段输入框 HTML：data-* 属性记录步骤/动作下标与字段名，供事件委托回写草稿。 */
 function textActionField(si, ai, key, label, value, wide = false, type = "text", list = "") {
   return `<div class="action-field ${wide ? "wide" : ""}"><label>${escapeHtml(label)}</label><input type="${type}"${list ? ` list="${list}"` : ""} data-action-field data-s="${si}" data-a="${ai}" data-key="${key}" value="${escapeHtml(value ?? "")}"></div>`;
 }
 
+/** 按动作类型渲染其参数编辑表单（列表编辑器与节点检查器共用）。 */
 function renderAction(action, si, ai) {
   let fields = "";
   if (["request", "send"].includes(action.type)) {
@@ -568,6 +630,7 @@ function renderAction(action, si, ai) {
   </div>`;
 }
 
+/** 切换编辑器模式：图形画布（React Flow）/ 步骤列表。 */
 function setEditorMode(mode) {
   state.editorMode = mode;
   $$("[data-editor-mode]").forEach((button) => button.classList.toggle("active", button.dataset.editorMode === mode));
@@ -576,6 +639,7 @@ function setEditorMode(mode) {
   if (mode === "visual") window.PilotFlowEditor?.setDefinition(state.draft);
 }
 
+/** 动作的一行摘要（画布节点上显示）。 */
 function actionSummary(action) {
   if (["request", "send"].includes(action.type)) return action.save_as ? `${action.data} → ${action.save_as}` : action.data;
   if (action.type === "receive") return `接收至 ${action.save_as} · ${action.timeout_ms} ms`;
@@ -590,12 +654,14 @@ function actionSummary(action) {
   return action.type;
 }
 
+/** 选中画布节点（测试项或动作）并刷新检查器。 */
 function selectFlowNode(stepIndex, actionIndex = null) {
   state.selectedStep = stepIndex;
   state.selectedAction = actionIndex;
   renderVisualEditor();
 }
 
+/** 节点检查器：显示选中测试项的属性表单或选中动作的参数表单。 */
 function renderNodeInspector() {
   const inspector = $("#node-inspector");
   const step = state.draft?.steps?.[state.selectedStep];
@@ -622,6 +688,7 @@ function renderNodeInspector() {
     <p class="inspector-tip">拖动此节点标题可调整执行顺序。点击内部动作可编辑通讯数据和判定条件。</p>`;
 }
 
+/** 渲染旧版可视化编辑器（节点卡片 + 拖拽排序）；新版画布见 PilotFlowEditor。 */
 function renderVisualEditor() {
   if (!$("#visual-editor")) return;
   const steps = state.draft?.steps || [];
@@ -649,6 +716,7 @@ function renderVisualEditor() {
   renderNodeInspector();
 }
 
+/** 编辑器输入事件（委托）：步骤字段直接写入草稿，动作字段走 updateActionField。 */
 function handleEditorInput(event) {
   const stepInput = event.target.closest("[data-step-field]");
   if (stepInput) {
@@ -659,6 +727,7 @@ function handleEditorInput(event) {
   if (event.target.matches("[data-action-field]")) updateActionField(event.target);
 }
 
+/** 编辑器 change 事件：下拉类字段变更后按需重渲染；切换动作类型时整体替换默认参数。 */
 function handleEditorChange(event) {
   if (event.target.closest("[data-step-field]")) renderVisualEditor();
   if (event.target.matches("[data-action-field]")) {
@@ -675,6 +744,7 @@ function handleEditorChange(event) {
   }
 }
 
+/** 编辑器命令按钮（委托）：删除/上下移测试项、添加动作，统一经 FlowModel 不可变更新。 */
 function handleEditorCommand(event) {
   const deleteButton = event.target.closest("[data-delete-action]");
   if (deleteButton) {
@@ -712,6 +782,7 @@ function handleEditorCommand(event) {
   renderSteps();
 }
 
+/** 渲染步骤列表编辑器 + 同步高级 JSON 文本框 + 刷新画布。 */
 function renderSteps() {
   const steps = state.draft?.steps || [];
   $("#steps-container").innerHTML = steps.length ? steps.map((step, si) => `
@@ -735,6 +806,7 @@ function renderSteps() {
   window.PilotFlowEditor?.setDefinition(state.draft);
 }
 
+/** 打开已有流程为编辑草稿（深拷贝，避免改动影响列表中的原始定义）。 */
 function openScript(scriptId) {
   const script = state.scripts.find((item) => item.id === Number(scriptId));
   if (!script) return;
@@ -746,6 +818,7 @@ function openScript(scriptId) {
   renderScriptLibrary();
 }
 
+/** 新建流程草稿：默认关联首个启用产品（或调用方指定的产品），含一个空白测试项。 */
 function newScriptDraft(productCode = "") {
   const firstProduct = state.master.products.find((item) => item.enabled);
   return { schema_version: 1, name: "新产品测试流程", product_model: productCode || (firstProduct ? firstProduct.code : ""), station_code: "", variables: {}, steps: [newStep()] };
@@ -818,6 +891,7 @@ function createNewScript(productCode = "") {
   $("#draft-name").focus();
 }
 
+/** 编译校验草稿并在页面上展示结果；返回是否通过。 */
 async function validateScript(showSuccess = true) {
   try {
     const result = await api("/api/scripts/validate", { method: "POST", body: { definition: state.draft } });
@@ -832,6 +906,7 @@ async function validateScript(showSuccess = true) {
   }
 }
 
+/** 保存流程：先编译校验，再按 draftId 决定新建/更新；保存后刷新版本与执行台。 */
 async function saveScript() {
   if (!await validateScript(false)) { toast("请先修正脚本校验错误", "error"); return; }
   try {
@@ -850,6 +925,7 @@ async function saveScript() {
   } catch (error) { toast(error.message, "error"); }
 }
 
+/** 动作字段回写草稿：按字段类型转换数字/JSON/断言期望值，烧录选项单独处理。 */
 function updateActionField(element) {
   const step = state.draft.steps[Number(element.dataset.s)];
   const action = step?.actions[Number(element.dataset.a)];
@@ -879,10 +955,12 @@ function updateActionField(element) {
   }
 }
 
+/** 清除旧版可视化编辑器的拖拽高亮。 */
 function clearDragStyles() {
   $$(".drag-over", $("#visual-editor")).forEach((element) => element.classList.remove("drag-over"));
 }
 
+/** 绑定旧版可视化编辑器的拖拽与点击事件（节点/动作拖放排序、点击选中）。 */
 function bindVisualEditor() {
   const visual = $("#visual-editor");
   if (!visual) return;
@@ -1002,6 +1080,7 @@ function bindVisualEditor() {
   });
 }
 
+/** 绑定流程编排页事件：新建/校验/保存、编辑器模式切换、元信息输入、JSON 应用等。 */
 function bindScriptEditor() {
   $("#new-script").addEventListener("click", () => createNewScript());
   $("#validate-script").addEventListener("click", () => validateScript());
@@ -1059,6 +1138,7 @@ function bindScriptEditor() {
   });
 }
 
+/** 加载协议目录与已保存配置。 */
 async function loadProtocols() {
   try {
     state.protocols = await api("/api/protocols");
@@ -1067,10 +1147,12 @@ async function loadProtocols() {
   } catch (error) { toast(error.message, "error"); }
 }
 
+/** 当前选中的协议对象。 */
 function selectedProtocol() {
   return state.protocols.find((item) => item.name === state.selectedProtocol);
 }
 
+/** 协议表单字段联动：depends_on 不满足时隐藏字段（如选“十进制”才显示数值类型）。 */
 function updateProtocolDependencies() {
   $$('[data-config-depends-key]', $("#protocol-form")).forEach((element) => {
     const controller = $(`[data-config-key="${element.dataset.configDependsKey}"]`, $("#protocol-form"));
@@ -1078,6 +1160,7 @@ function updateProtocolDependencies() {
   });
 }
 
+/** 渲染通讯配置页：左侧协议导航 + 右侧按分组（连接/下发编码/响应解析）的参数表单。 */
 function renderProtocols() {
   $("#protocol-tabs").innerHTML = state.protocols.map((protocol) => `
     <button class="protocol-tab ${protocol.name === state.selectedProtocol ? "active" : ""}" data-protocol="${escapeHtml(protocol.name)}">
@@ -1121,6 +1204,7 @@ function renderProtocols() {
   $("#protocol-test-result").className = "";
 }
 
+/** 收集协议表单 + 高级 JSON 为最终配置对象（表单字段覆盖 JSON 同名键）。 */
 function collectProtocolConfig() {
   const protocol = selectedProtocol();
   const config = parseJsonField($("#protocol-json").value, "通讯配置");
@@ -1135,6 +1219,7 @@ function collectProtocolConfig() {
   return config;
 }
 
+/** 保存当前协议配置。 */
 async function saveProtocol(showToast = true) {
   const config = collectProtocolConfig();
   const name = state.selectedProtocol;
@@ -1145,6 +1230,7 @@ async function saveProtocol(showToast = true) {
   return result.config;
 }
 
+/** 测试连接：先保存配置再调用后端探测。 */
 async function testProtocol() {
   const result = $("#protocol-test-result");
   result.className = "";
@@ -1162,6 +1248,7 @@ async function testProtocol() {
   }
 }
 
+/** 加载固件仓、烧录后端目录与当前后端配置。 */
 async function loadFirmware() {
   try {
     const [firmware, flashers, config] = await Promise.all([
@@ -1175,6 +1262,7 @@ async function loadFirmware() {
   } catch (error) { toast(error.message, "error"); }
 }
 
+/** 固件名称候选（flash 动作的 datalist 与画布编辑器共用）。 */
 function renderFirmwareOptions() {
   const datalist = $("#firmware-options");
   if (datalist) {
@@ -1184,6 +1272,7 @@ function renderFirmwareOptions() {
   window.PilotFlowEditor?.setFirmware(state.firmware);
 }
 
+/** 渲染固件仓表格与烧录后端配置表单。 */
 function renderFirmware() {
   $("#firmware-count").textContent = state.firmware.length;
   $("#firmware-table").innerHTML = state.firmware.length ? state.firmware.map((item) => `
@@ -1202,6 +1291,7 @@ function renderFirmware() {
   $("#flasher-test-result").className = "";
 }
 
+/** 登记固件：优先上传选择的文件，否则按工作站本地路径入仓。 */
 async function registerFirmware(event) {
   event.preventDefault();
   try {
@@ -1227,6 +1317,7 @@ async function registerFirmware(event) {
   } catch (error) { toast(error.message, "error"); }
 }
 
+/** 校验固件 SHA-256 与登记一致。 */
 async function verifyFirmware(button) {
   button.disabled = true;
   try {
@@ -1236,6 +1327,7 @@ async function verifyFirmware(button) {
   finally { button.disabled = false; }
 }
 
+/** 保存烧录后端配置（JSON 参数需为对象）。 */
 async function saveFlasherConfig(showToast = true) {
   const config = parseJsonField($("#flasher-config").value, "烧录后端参数");
   if (!config || Array.isArray(config) || typeof config !== "object") throw new Error("烧录后端参数必须是 JSON 对象");
@@ -1245,6 +1337,7 @@ async function saveFlasherConfig(showToast = true) {
   return saved;
 }
 
+/** 探测烧录后端可用性。 */
 async function testFlasher() {
   const result = $("#flasher-test-result");
   result.className = "";
@@ -1262,6 +1355,7 @@ async function testFlasher() {
   }
 }
 
+/** 应用工位策略到页面：侧边栏工位、工位策略表单（工位编号下拉随主数据联动）、执行台预览。 */
 function applyStationSettings(settings) {
   state.settings = settings;
   renderStationSettingOptions();
@@ -1275,12 +1369,14 @@ function applyStationSettings(settings) {
   renderPreview();
 }
 
+/** 读取工位策略。 */
 async function loadStationSettings() {
   const settings = await api("/api/settings");
   applyStationSettings(settings);
   return settings;
 }
 
+/** 加载 MES 配置（报告上传 + 主数据段）与工位策略，填充 MES 集成页。 */
 async function loadMesSettings() {
   try {
     const [config] = await Promise.all([api("/api/mes/config"), loadStationSettings()]);
@@ -1305,6 +1401,7 @@ async function loadMesSettings() {
   } catch (error) { toast(error.message, "error"); }
 }
 
+/** 保存 MES 配置与工位策略（保留未在表单暴露的配置键）。 */
 async function saveMesSettings(showToast = true) {
   const headers = parseJsonField($("#mes-headers").value, "请求头");
   const mapping = parseJsonField($("#mes-mapping").value, "字段映射");
@@ -1351,6 +1448,7 @@ async function saveMesSettings(showToast = true) {
   if (showToast) toast("MES 与工位配置已保存", "success");
 }
 
+/** 报文预览：保存配置后请求后端渲染实际发送结构（不调用 MES）。 */
 async function previewMes() {
   try {
     await saveMesSettings(false);
@@ -1360,11 +1458,13 @@ async function previewMes() {
   } catch (error) { toast(error.message, "error"); }
 }
 
+/** 主数据实体元信息：表格/表单/字段选择器与中文名的映射（products/stations 共用一套逻辑）。 */
 const masterEntityMeta = {
   products: { tbody: "#master-products", count: "#master-products-count", form: "#master-product-form", fields: [["code", "#mp-code"], ["name", "#mp-name"], ["spec", "#mp-spec"]], cancel: "#mp-cancel", label: "产品" },
   stations: { tbody: "#master-stations", count: "#master-stations-count", form: "#master-station-form", fields: [["code", "#ms-code"], ["name", "#ms-name"], ["line", "#ms-line"], ["station_type", "#ms-type"]], cancel: "#ms-cancel", label: "工站" },
 };
 
+/** 加载产品/工站主数据并刷新 MES 页表格与所有联动下拉（执行台、流程编排、工位策略）。 */
 async function loadMasterData() {
   try {
     const [products, stations] = await Promise.all([api("/api/mes/products"), api("/api/mes/stations")]);
@@ -1381,12 +1481,14 @@ async function loadMasterData() {
   } catch (error) { toast(error.message, "error"); }
 }
 
+/** 主数据来源与最近同步时间说明行。 */
 function renderMasterMeta() {
   const modeText = state.master.mode === "simulator" ? "模拟器" : "HTTP 接口";
   const format = (value) => (value ? formatTime(value) : "未同步");
   $("#master-sync-meta").textContent = `来源：${modeText} · 产品 ${format(state.master.productsSync)} · 工站 ${format(state.master.stationsSync)}`;
 }
 
+/** 渲染产品/工站主数据表格（来源标记、启停徽标、编辑/停用/删除操作）。 */
 function renderMasterTables() {
   renderMasterMeta();
   for (const [entity, meta] of Object.entries(masterEntityMeta)) {
@@ -1411,6 +1513,7 @@ function renderMasterTables() {
   }
 }
 
+/** 主数据下拉选项：启用行 + 当前值兜底（已停用/不在主数据时保留并标注）。 */
 function masterSelectOptions(items, currentValue, placeholder) {
   const enabled = items.filter((item) => item.enabled);
   const options = [`<option value="">${escapeHtml(placeholder)}</option>`];
@@ -1445,6 +1548,7 @@ function renderStationSettingOptions() {
   select.value = current;
 }
 
+/** 从 MES 同步主数据（products/stations/both），完成后刷新主数据与流程列表。 */
 async function syncMaster(target) {
   try {
     const result = await api("/api/mes/sync", { method: "POST", body: { target } });
@@ -1456,6 +1560,7 @@ async function syncMaster(target) {
   } catch (error) { toast(error.message, "error"); }
 }
 
+/** 清空主数据添加/编辑表单并恢复为“添加”模式。 */
 function resetMasterForm(entity) {
   const meta = masterEntityMeta[entity];
   meta.fields.forEach(([, selector]) => { $(selector).value = ""; $(selector).disabled = false; });
@@ -1464,6 +1569,7 @@ function resetMasterForm(entity) {
   $(meta.cancel).hidden = true;
 }
 
+/** 把本地行载入表单进入编辑模式（编号不可改）。 */
 function editMasterItem(entity, code) {
   const item = state.master[entity].find((entry) => entry.code === code);
   if (!item) return;
@@ -1476,6 +1582,7 @@ function editMasterItem(entity, code) {
   $(meta.fields[1][1]).focus();
 }
 
+/** 提交主数据表单：有 editCode 走更新，否则新建本地行。 */
 async function submitMasterForm(form) {
   const entity = form.dataset.entity;
   const meta = masterEntityMeta[entity];
@@ -1495,6 +1602,7 @@ async function submitMasterForm(form) {
   } catch (error) { toast(error.message, "error"); }
 }
 
+/** 启用/停用主数据行（MES 行唯一允许的本地操作）。 */
 async function toggleMasterItem(entity, code) {
   const item = state.master[entity].find((entry) => entry.code === code);
   if (!item) return;
@@ -1505,6 +1613,7 @@ async function toggleMasterItem(entity, code) {
   } catch (error) { toast(error.message, "error"); }
 }
 
+/** 删除本地主数据行（需确认；MES 行后端会拒绝）。 */
 async function deleteMasterItem(entity, code) {
   const meta = masterEntityMeta[entity];
   if (!window.confirm(`确认删除本地${meta.label} ${code}？`)) return;
@@ -1515,6 +1624,7 @@ async function deleteMasterItem(entity, code) {
   } catch (error) { toast(error.message, "error"); }
 }
 
+/** 查询报告列表（SN 模糊 + 结果 + MES 状态筛选）。 */
 async function loadReports() {
   try {
     const params = new URLSearchParams();
@@ -1541,6 +1651,7 @@ async function loadReports() {
   } catch (error) { toast(error.message, "error"); }
 }
 
+/** 报告详情弹窗：汇总信息、测试项明细、控制流记录、烧录记录、MES 上传信息与日志。 */
 async function viewReport(reportId) {
   const modal = $("#report-modal");
   modal.hidden = false;
@@ -1574,6 +1685,7 @@ async function viewReport(reportId) {
   }
 }
 
+/** 上传/重试上传报告到 MES，成功后刷新列表与弹窗。 */
 async function uploadReport(reportId, button) {
   if (button) button.disabled = true;
   try {
@@ -1592,10 +1704,12 @@ async function uploadReport(reportId, button) {
   }
 }
 
+/** 角色 → 中文名。 */
 function roleText(role) {
   return role === "admin" ? "管理员" : "操作工";
 }
 
+/** 按角色应用界面权限：隐藏管理员专属入口，写入当前用户与操作员。 */
 function applyRole() {
   const user = state.user;
   const isAdmin = user?.role === "admin";
@@ -1608,6 +1722,7 @@ function applyRole() {
   if (!isAdmin) $("#report-mes").value = "";
 }
 
+/** 切换到登录页（清空运行状态，401 时由 api() 统一调用）。 */
 function showLogin(message = "") {
   clearTimeout(state.pollTimer);
   state.user = null;
@@ -1620,6 +1735,7 @@ function showLogin(message = "") {
   document.body.classList.add("authenticating");
 }
 
+/** 登录成功后进入应用外壳。 */
 function showApplication(user) {
   state.user = user;
   document.body.classList.remove("authenticating");
@@ -1628,6 +1744,7 @@ function showApplication(user) {
   applyRole();
 }
 
+/** 登录表单提交。 */
 async function login(event) {
   event.preventDefault();
   const button = $("#login-submit");
@@ -1648,11 +1765,13 @@ async function login(event) {
   }
 }
 
+/** 退出登录。 */
 async function logout() {
   try { await api("/api/auth/logout", { method: "POST" }); } catch {}
   showLogin("已安全退出，请重新登录");
 }
 
+/** 加载用户列表（仅管理员）。 */
 async function loadUsers() {
   if (state.user?.role !== "admin") return;
   try {
@@ -1668,6 +1787,7 @@ async function loadUsers() {
   } catch (error) { toast(error.message, "error"); }
 }
 
+/** 创建用户。 */
 async function createUser(event) {
   event.preventDefault();
   try {
@@ -1683,6 +1803,7 @@ async function createUser(event) {
   } catch (error) { toast(error.message, "error"); }
 }
 
+/** 启用/停用账号。 */
 async function toggleUser(button) {
   const username = button.dataset.toggleUser;
   try {
@@ -1692,6 +1813,7 @@ async function toggleUser(button) {
   } catch (error) { toast(error.message, "error"); }
 }
 
+/** 管理员重置他人密码（弹窗输入新密码）。 */
 async function resetUserPassword(button) {
   const username = button.dataset.resetUser;
   const password = window.prompt(`为用户 ${username} 设置新密码（至少 8 位）`);
@@ -1703,11 +1825,13 @@ async function resetUserPassword(button) {
   } catch (error) { toast(error.message, "error"); }
 }
 
+/** 关闭修改密码弹窗并清空表单。 */
 function closePasswordModal() {
   $("#password-modal").hidden = true;
   $("#password-form").reset();
 }
 
+/** 修改自己的密码（需验证当前密码，两次输入需一致）。 */
 async function changeOwnPassword(event) {
   event.preventDefault();
   const next = $("#new-own-password").value;
@@ -1719,11 +1843,16 @@ async function changeOwnPassword(event) {
   } catch (error) { toast(error.message, "error"); }
 }
 
+/** 关闭报告详情弹窗。 */
 function closeReport() {
   $("#report-modal").hidden = true;
   $("#report-modal-content").innerHTML = "";
 }
 
+/**
+ * 绑定全部事件：登录/账号、导航、执行台（扫码、开始、F2 快捷键、三个索引下拉）、
+ * 流程编辑器、协议/固件/MES/主数据表单，以及报告相关的文档级事件委托。
+ */
 function bindEvents() {
   $("#login-form").addEventListener("submit", login);
   $$("[data-fill-account]").forEach((button) => button.addEventListener("click", () => {
@@ -1833,6 +1962,10 @@ function bindEvents() {
   });
 }
 
+/**
+ * 登录后的应用启动：管理员挂载 React 流程画布（一次）、健康检查、
+ * 并行加载流程与工位策略、恢复未完成的运行，最后按 URL hash 进入对应页面。
+ */
 async function startApplication() {
   if (state.user?.role === "admin" && !state.applicationMounted) {
     window.PilotFlowEditor?.mount($("#react-flow-editor"), {
@@ -1855,6 +1988,7 @@ async function startApplication() {
   navigate(pageMeta[location.hash.slice(1)] ? location.hash.slice(1) : "production");
 }
 
+/** 入口：绑定事件、启动时钟、尝试用已有会话恢复登录（失败则显示登录页）。 */
 async function initialize() {
   bindEvents();
   setInterval(() => { $("#current-time").textContent = new Date().toLocaleString("zh-CN", { hour12: false }); }, 1000);

@@ -1,3 +1,12 @@
+"""SQLite 数据访问层：表结构定义、初始化/轻量迁移、事务与常用查询封装。
+
+设计要点：
+- 单文件 SQLite（WAL 模式），随 Python 自带，适合单工位工作站离线运行；
+- 所有表在 ``SCHEMA`` 中 ``CREATE TABLE IF NOT EXISTS`` 定义，``initialize()`` 启动时执行，
+  并对老库做列级迁移（ALTER TABLE 补列、reports 表重建等），保证老数据文件可直接升级；
+- 唯一索引兜底关键业务规则：SN 报告幂等、单工站活动运行唯一、控制流路径唯一；
+- 默认配置（协议、工位策略、MES、烧录后端）在初始化时写入 settings 表，可页面化修改。
+"""
 from __future__ import annotations
 
 import json
@@ -12,6 +21,19 @@ from .protocol_definitions import DEFAULT_PROTOCOL_CONFIGS
 from .utils import json_dumps, utc_now
 
 
+# 全量建表脚本。各表用途：
+#   products        SN 登记表：证明“先扫码后测试”，记录 SN 与产品型号的绑定
+#   scripts         测试流程（低代码 JSON 定义，含版本与启停；station_code 为绑定工站）
+#   mes_products / mes_stations  MES 主数据本地缓存（产品/工站，source 区分 MES 同步与本地添加）
+#   protocol_configs 通讯协议连接配置（按协议名一行）
+#   settings        键值配置（工位策略、MES、烧录后端、登录密钥等，value 为 JSON）
+#   users           登录账号（角色、加盐口令哈希、会话版本号）
+#   test_runs       测试运行（一次扫码测试一条，含脚本快照，保证报告可复现）
+#   test_items      运行内的逐项结果（含控制流展开后的节点路径与迭代次数）
+#   control_events  条件/循环/并行/子流程等控制节点的执行轨迹
+#   reports         正式报告（每次测试一份，含完整报告 JSON 与 MES 上传状态）
+#   mes_upload_logs MES 上传日志（每次尝试一条，含请求与响应原文）
+#   flash_records   固件烧录记录（固件、校验和、后端、结果）
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS products (
     sn TEXT PRIMARY KEY,
@@ -101,6 +123,7 @@ CREATE TABLE IF NOT EXISTS test_runs (
     FOREIGN KEY(script_id) REFERENCES scripts(id)
 );
 
+-- 同一工站最多一条 RUNNING：数据库层防止两个产品同时争用同一套硬件
 CREATE UNIQUE INDEX IF NOT EXISTS idx_active_station
 ON test_runs(station) WHERE status = 'RUNNING';
 CREATE INDEX IF NOT EXISTS idx_runs_sn ON test_runs(sn);
@@ -208,6 +231,8 @@ CREATE INDEX IF NOT EXISTS idx_flash_records_run ON flash_records(run_id, id);
 CREATE INDEX IF NOT EXISTS idx_flash_records_sn ON flash_records(sn, id);
 """
 
+# MES 默认配置：报告上传（endpoint/映射模板）+ 主数据同步（master_data 段）。
+# 模拟器模式使用内置示例主数据；HTTP 模式按 url/items_path/field_map 拉取真实 MES。
 DEFAULT_MES_CONFIG = {
     "endpoint": "http://127.0.0.1:9000/api/mes/test-reports",
     "method": "POST",
@@ -246,6 +271,7 @@ DEFAULT_MES_CONFIG = {
     },
 }
 
+# 工位策略默认值：终端工站、默认操作员、SN 正则、报告自动上传开关、失败复测上限
 DEFAULT_SETTINGS = {
     "station_id": "STATION-01",
     "operator": "OP-001",
@@ -254,6 +280,7 @@ DEFAULT_SETTINGS = {
     "max_retests": 3,
 }
 
+# 烧录后端默认配置：仿真器后端（无硬件时可完整演示烧录流程）
 DEFAULT_FLASHER_CONFIG = {
     "backend": "simulator",
     "config": {"step_delay_ms": 50},
@@ -316,7 +343,15 @@ def _reports_sn_is_unique(connection: sqlite3.Connection) -> bool:
 
 
 class Database:
+    """SQLite 访问入口：负责连接管理、初始化迁移、事务与 settings 读写。
+
+    每个操作使用独立短连接（sqlite3 连接非线程安全，执行器在线程池中运行），
+    WAL 模式保证读写不互斥；写事务统一走 ``BEGIN IMMEDIATE`` 提前拿写锁，
+    避免并发请求在提交时才冲突。
+    """
+
     def __init__(self, path: str | Path | None = None):
+        # 未显式指定路径时，使用 <工作目录>/data/testsystem.db（可用 TESTSYSTEM_DATA_DIR 覆盖）
         if path is None:
             data_dir = Path(os.getenv("TESTSYSTEM_DATA_DIR", str(Path.cwd() / "data")))
             data_dir.mkdir(parents=True, exist_ok=True)
@@ -325,6 +360,7 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def connect(self) -> sqlite3.Connection:
+        """新建连接：Row 工厂按列名取值，开启外键约束与 15s 忙等待（配合 WAL）。"""
         connection = sqlite3.connect(self.path, timeout=15)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
@@ -333,6 +369,7 @@ class Database:
 
     @contextmanager
     def session(self) -> Iterator[sqlite3.Connection]:
+        """普通会话：自动提交/回滚并关闭连接，供只读或单语句写入使用。"""
         connection = self.connect()
         try:
             with connection:
@@ -341,6 +378,11 @@ class Database:
             connection.close()
 
     def initialize(self) -> None:
+        """建表 + 轻量迁移 + 写入默认配置与演示流程；服务启动时调用一次。
+
+        迁移内容：reports 表重建（去掉 SN 唯一约束）、test_items/scripts 补列、
+        协议配置与 MES 配置按“默认值 + 已存值”合并（老配置自动获得新增字段）。
+        """
         with self.session() as connection:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript(SCHEMA)
@@ -352,6 +394,7 @@ class Database:
                     connection.executescript(_REPORTS_REBUILD_SCRIPT)
                 finally:
                     connection.execute("PRAGMA foreign_keys = ON")
+            # test_items 为控制流版本补 node_id/path/iteration 列，并用 item_id 回填历史数据
             item_columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(test_items)").fetchall()
             }
@@ -361,12 +404,15 @@ class Database:
             connection.execute(
                 "UPDATE test_items SET node_id = COALESCE(node_id, item_id), path = COALESCE(path, item_id)"
             )
+            # scripts 为工站绑定补 station_code 列
             script_columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(scripts)").fetchall()
             }
             if "station_code" not in script_columns:
                 connection.execute("ALTER TABLE scripts ADD COLUMN station_code TEXT NOT NULL DEFAULT ''")
             now = utc_now()
+            # 协议配置：缺失的协议补默认配置；已有配置与默认值合并（新增字段自动获得默认值），
+            # 并兼容旧字段名 response_format → receive_format
             for name, config in DEFAULT_PROTOCOL_CONFIGS.items():
                 connection.execute(
                     "INSERT OR IGNORE INTO protocol_configs(name, config_json, updated_at) VALUES (?, ?, ?)",
@@ -382,11 +428,13 @@ class Database:
                         "UPDATE protocol_configs SET config_json = ? WHERE name = ?",
                         (json_dumps(merged), name),
                     )
+            # 键值配置：工位策略、MES、烧录后端，缺失时写默认值
             for key, value in {**DEFAULT_SETTINGS, "mes": DEFAULT_MES_CONFIG, "flasher": DEFAULT_FLASHER_CONFIG}.items():
                 connection.execute(
                     "INSERT OR IGNORE INTO settings(key, value_json, updated_at) VALUES (?, ?, ?)",
                     (key, json_dumps(value), now),
                 )
+            # MES 配置合并：老配置缺 master_data 段或段内字段时按默认值补齐
             stored_mes = json.loads(
                 connection.execute("SELECT value_json FROM settings WHERE key = 'mes'").fetchone()["value_json"]
             )
@@ -402,6 +450,7 @@ class Database:
                     "UPDATE settings SET value_json = ?, updated_at = ? WHERE key = 'mes'",
                     (json_dumps(merged_mes), now),
                 )
+            # 空库时写入演示流程，保证首次启动即可完整走通扫码测试
             if connection.execute("SELECT COUNT(*) FROM scripts").fetchone()[0] == 0:
                 definition = compile_script(DEFAULT_SCRIPT)
                 connection.execute(
@@ -410,10 +459,12 @@ class Database:
                 )
         from .auth import AuthService
 
+        # 初始化账号体系（默认 admin/operator 账号与登录密钥）；局部导入避免循环依赖
         AuthService(self).initialize()
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
+        """写事务：BEGIN IMMEDIATE 提前获取写锁，异常回滚，保证多步写入原子性。"""
         connection = self.connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -426,23 +477,28 @@ class Database:
             connection.close()
 
     def one(self, sql: str, params: tuple[Any, ...] = ()) -> sqlite3.Row | None:
+        """查询单行；无结果返回 None。"""
         with self.session() as connection:
             return connection.execute(sql, params).fetchone()
 
     def all(self, sql: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
+        """查询多行，返回 Row 列表（可按列名访问）。"""
         with self.session() as connection:
             return connection.execute(sql, params).fetchall()
 
     def execute(self, sql: str, params: tuple[Any, ...] = ()) -> int:
+        """执行单条写语句，返回受影响行数。"""
         with self.session() as connection:
             cursor = connection.execute(sql, params)
             return cursor.rowcount
 
     def setting(self, key: str, default: Any = None) -> Any:
+        """读取 settings 表中的 JSON 配置；不存在时返回 default。"""
         row = self.one("SELECT value_json FROM settings WHERE key = ?", (key,))
         return json.loads(row["value_json"]) if row else default
 
     def save_setting(self, key: str, value: Any) -> None:
+        """写入 settings 表（存在则覆盖），value 序列化为 JSON。"""
         self.execute(
             "INSERT INTO settings(key, value_json, updated_at) VALUES (?, ?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at",
@@ -450,6 +506,10 @@ class Database:
         )
 
     def recover_interrupted_runs(self) -> None:
+        """启动时收尾中断的运行：服务重启把 RUNNING 运行与其未完成项标记为失败。
+
+        保证“单工站活动运行唯一”索引不会被崩溃残留占住，页面上也能看到明确的中断原因。
+        """
         now = utc_now()
         with self.transaction() as connection:
             running = connection.execute("SELECT id FROM test_runs WHERE status = 'RUNNING'").fetchall()
